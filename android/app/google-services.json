@@ -1,0 +1,29 @@
+{
+  "project_info": {
+    "project_number": "737992185007",
+    "project_id": "shee-a0c0b",
+    "storage_bucket": "shee-a0c0b.firebasestorage.app"
+  },
+  "client": [
+    {
+      "client_info": {
+        "mobilesdk_app_id": "1:737992185007:android:26b3a31588345bcc18b05a",
+        "android_client_info": {
+          "package_name": "com.example.safe_route"
+        }
+      },
+      "oauth_client": [],
+      "api_key": [
+        {
+          "current_key": "AIzaSyBs_iTv31hzGIMkJh3IhnrNyIS0iIi8F0E"
+        }
+      ],
+      "services": {
+        "appinvite_service": {
+          "other_platform_oauth_client": []
+        }
+      }
+    }
+  ],
+  "configuration_version": "1"
+}

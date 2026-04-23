@@ -143,6 +143,14 @@ class _MapScreenState extends State<MapScreen> {
 
   void _showAddUnsafeZoneDialog(LatLng point) {
     var selectedReason = 'Poor lighting'.obs;
+    final selectedStartTime = Rxn<TimeOfDay>();
+    final selectedEndTime = Rxn<TimeOfDay>();
+
+    String formatTime(TimeOfDay time) {
+      final hour = time.hour.toString().padLeft(2, '0');
+      final minute = time.minute.toString().padLeft(2, '0');
+      return '$hour:$minute';
+    }
 
     Get.defaultDialog(
       title: "Mark Unsafe Area",
@@ -178,6 +186,59 @@ class _MapScreenState extends State<MapScreen> {
                   ),
                 ],
               ),
+              const SizedBox(height: 16),
+              const Align(
+                alignment: Alignment.centerLeft,
+                child: Text(
+                  "Unsafe Time (Optional):",
+                  style: TextStyle(fontWeight: FontWeight.bold),
+                ),
+              ),
+              const SizedBox(height: 8),
+              Row(
+                children: [
+                  Expanded(
+                    child: OutlinedButton.icon(
+                      onPressed: () async {
+                        final picked = await showTimePicker(
+                          context: context,
+                          initialTime:
+                              selectedStartTime.value ?? TimeOfDay.now(),
+                        );
+                        if (picked != null) {
+                          selectedStartTime.value = picked;
+                        }
+                      },
+                      icon: const Icon(Icons.access_time),
+                      label: Text(
+                        selectedStartTime.value == null
+                            ? "From"
+                            : "From ${formatTime(selectedStartTime.value!)}",
+                      ),
+                    ),
+                  ),
+                  const SizedBox(width: 8),
+                  Expanded(
+                    child: OutlinedButton.icon(
+                      onPressed: () async {
+                        final picked = await showTimePicker(
+                          context: context,
+                          initialTime: selectedEndTime.value ?? TimeOfDay.now(),
+                        );
+                        if (picked != null) {
+                          selectedEndTime.value = picked;
+                        }
+                      },
+                      icon: const Icon(Icons.schedule),
+                      label: Text(
+                        selectedEndTime.value == null
+                            ? "To"
+                            : "To ${formatTime(selectedEndTime.value!)}",
+                      ),
+                    ),
+                  ),
+                ],
+              ),
             ],
           )),
       textConfirm: "Confirm",
@@ -186,7 +247,16 @@ class _MapScreenState extends State<MapScreen> {
       buttonColor: Colors.redAccent,
       onConfirm: () {
         Get.back(); // Dismiss dialog
-        _heatmapController.addUnsafeZone(point);
+        _heatmapController.addUnsafeZone(
+          point,
+          reason: selectedReason.value,
+          timeStart: selectedStartTime.value == null
+              ? null
+              : formatTime(selectedStartTime.value!),
+          timeEnd: selectedEndTime.value == null
+              ? null
+              : formatTime(selectedEndTime.value!),
+        );
       },
     );
   }

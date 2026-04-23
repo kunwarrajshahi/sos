@@ -47,11 +47,19 @@ class HeatmapController extends GetxController {
   }
 
   // Package target coordinates into dynamic objects piping directly to centralized Cloud Firestore mechanisms
-  Future<void> addUnsafeZone(LatLng point) async {
+  Future<void> addUnsafeZone(
+    LatLng point, {
+    String? reason,
+    String? timeStart,
+    String? timeEnd,
+  }) async {
     try {
       await FirebaseFirestore.instance.collection('unsafe_zones').add({
         'lat': point.latitude,
         'lng': point.longitude,
+        'reason': reason,
+        'time_start': timeStart,
+        'time_end': timeEnd,
         'timestamp': FieldValue.serverTimestamp(),
       });
 

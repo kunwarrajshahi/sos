@@ -159,6 +159,22 @@ class HistoryController extends GetxController {
     );
   }
 
+  Future<void> recordJourneyEvent({
+    required String title,
+    required String subtitle,
+    Map<String, dynamic> metadata = const {},
+  }) async {
+    await addEntry(
+      HistoryEntry(
+        type: 'journey',
+        title: title,
+        subtitle: subtitle,
+        timestamp: DateTime.now(),
+        metadata: metadata,
+      ),
+    );
+  }
+
   Future<void> clearHistory() async {
     entries.clear();
     final prefs = await SharedPreferences.getInstance();

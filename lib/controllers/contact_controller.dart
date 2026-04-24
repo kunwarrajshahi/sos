@@ -1,6 +1,5 @@
 import 'package:cloud_firestore/cloud_firestore.dart';
 import 'package:firebase_auth/firebase_auth.dart';
-import 'package:flutter/material.dart';
 import 'package:get/get.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 import 'package:permission_handler/permission_handler.dart';
@@ -20,60 +19,48 @@ class ContactController extends GetxController {
   void onInit() {
     super.onInit();
     loadContacts();
-    // Delay to ensure UI is ready before prompting natively
-    Future.delayed(const Duration(seconds: 2), () {
-      checkAndRequestSmsPermission();
-    });
+    refreshSmsPermissionStatus();
   }
 
-  Future<bool> checkAndRequestSmsPermission() async {
-    // Check current status first
-    PermissionStatus currentStatus = await Permission.sms.status;
+  Future<void> refreshSmsPermissionStatus() async {
+    final smsStatus = await Permission.sms.status;
+    final phoneStatus = await Permission.phone.status;
+    isSmsPermissionGranted.value = smsStatus.isGranted && phoneStatus.isGranted;
+  }
 
-    if (currentStatus.isGranted) {
+  Future<bool> checkAndRequestSmsPermission({
+    bool requestIfNeeded = true,
+  }) async {
+    final smsStatus = await Permission.sms.status;
+    final phoneStatus = await Permission.phone.status;
+    final alreadyGranted = smsStatus.isGranted && phoneStatus.isGranted;
+    if (alreadyGranted) {
       isSmsPermissionGranted.value = true;
       return true;
     }
 
-    if (currentStatus.isPermanentlyDenied) {
-      _showPermanentlyDeniedDialog();
+    if (!requestIfNeeded) {
+      isSmsPermissionGranted.value = false;
       return false;
     }
 
-    // Since Android 11+, we need user interaction to show the native permission dialog.
-    // If not granted, we prompt the user with OUR dialog first.
-    Get.defaultDialog(
-      title: "Permission Required",
-      middleText:
-          "SMS permission is strictly needed to directly send emergency SOS alerts to your contacts. Please click 'Grant' to allow this permission.",
-      textConfirm: "Grant",
-      confirmTextColor: Colors.white,
-      onConfirm: () async {
-        Get.back(); // close our dialog
+    final statuses = await [Permission.sms, Permission.phone].request();
+    final resolvedSms = statuses[Permission.sms] ?? smsStatus;
+    final resolvedPhone = statuses[Permission.phone] ?? phoneStatus;
+    final granted = resolvedSms.isGranted && resolvedPhone.isGranted;
 
-        // NOW we request the native permission (tied to user tap)
-        Map<Permission, PermissionStatus> statuses = await [
-          Permission.sms,
-          Permission.phone,
-        ].request();
+    isSmsPermissionGranted.value = granted;
 
-        PermissionStatus newStatus =
-            statuses[Permission.sms] ?? PermissionStatus.denied;
-        isSmsPermissionGranted.value = newStatus.isGranted;
+    if (resolvedSms.isPermanentlyDenied || resolvedPhone.isPermanentlyDenied) {
+      _showPermanentlyDeniedDialog();
+    } else if (!granted) {
+      Get.snackbar(
+        'Permission Denied',
+        'Direct SOS SMS is disabled until SMS and phone permissions are granted.',
+      );
+    }
 
-        if (newStatus.isPermanentlyDenied) {
-          _showPermanentlyDeniedDialog();
-        } else if (newStatus.isDenied) {
-          Get.snackbar(
-            "Permission Denied",
-            "SOS directly via SMS will not work unless permitted.",
-          );
-        }
-      },
-      textCancel: "Cancel",
-    );
-
-    return false;
+    return granted;
   }
 
   void _showPermanentlyDeniedDialog() {
@@ -97,7 +84,10 @@ class ContactController extends GetxController {
 
   Future<void> addContact(String phoneNumber) async {
     if (contacts.length >= 4) {
-      Get.snackbar("Limit Reached", "SafeRoute supports up to 4 emergency contacts.");
+      Get.snackbar(
+        "Limit Reached",
+        "SafeRoute supports up to 4 emergency contacts.",
+      );
       return;
     }
 
@@ -140,9 +130,9 @@ class ContactController extends GetxController {
       'emergencyContact4': contacts.length > 3 ? contacts[3] : '',
     };
 
-    await FirebaseFirestore.instance.collection('users').doc(user.uid).set(
-      data,
-      SetOptions(merge: true),
-    );
+    await FirebaseFirestore.instance
+        .collection('users')
+        .doc(user.uid)
+        .set(data, SetOptions(merge: true));
   }
 }

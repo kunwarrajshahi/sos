@@ -3,14 +3,19 @@ package com.example.safe_route
 import android.Manifest
 import android.app.Activity
 import android.app.PendingIntent
+import android.content.ContentValues
 import android.content.BroadcastReceiver
 import android.content.Context
 import android.content.Intent
 import android.content.IntentFilter
 import android.content.pm.PackageManager
+import android.os.Environment
 import android.os.Build
 import android.os.BatteryManager
 import android.os.Bundle
+import android.os.Handler
+import android.os.Looper
+import android.provider.MediaStore
 import android.telephony.SmsManager
 import android.telephony.SubscriptionManager
 import android.view.WindowManager
@@ -18,6 +23,9 @@ import androidx.core.content.ContextCompat
 import io.flutter.embedding.android.FlutterActivity
 import io.flutter.embedding.engine.FlutterEngine
 import io.flutter.plugin.common.MethodChannel
+import java.util.ArrayList
+import java.io.File
+import java.io.FileInputStream
 
 class MainActivity : FlutterActivity() {
     private val smsChannelName = "safe_route/sms"
@@ -80,20 +88,20 @@ class MainActivity : FlutterActivity() {
                     result.success(getBatteryLevel())
                 }
 
-                "launchEmergencyCall" -> {
-                    val phoneNumber = call.argument<String>("phoneNumber")
-                    if (phoneNumber.isNullOrBlank()) {
+                "saveRecordingToDownloads" -> {
+                    val sourcePath = call.argument<String>("sourcePath")
+                    val displayName = call.argument<String>("displayName")
+                    if (sourcePath.isNullOrBlank() || displayName.isNullOrBlank()) {
                         result.success(
                             mapOf(
                                 "success" to false,
-                                "usedActionCall" to false,
-                                "errorMessage" to "Missing phone number.",
+                                "errorMessage" to "Missing recording source path or file name.",
                             ),
                         )
                         return@setMethodCallHandler
                     }
 
-                    result.success(launchEmergencyCall(phoneNumber))
+                    result.success(saveRecordingToDownloads(sourcePath, displayName))
                 }
 
                 else -> result.notImplemented()
@@ -124,7 +132,6 @@ class MainActivity : FlutterActivity() {
 
         val smsManager = getSmsManager(subscriptionId)
         val action = "com.example.safe_route.SMS_SENT.${System.nanoTime()}"
-        val sentIntent = Intent(action)
         val pendingIntentFlags =
             PendingIntent.FLAG_UPDATE_CURRENT or
                 if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
@@ -132,21 +139,20 @@ class MainActivity : FlutterActivity() {
                 } else {
                     0
                 }
-        val sentPendingIntent = PendingIntent.getBroadcast(
-            this,
-            action.hashCode(),
-            sentIntent,
-            pendingIntentFlags,
-        )
-
         var completed = false
         var receiver: BroadcastReceiver? = null
+        val mainHandler = Handler(Looper.getMainLooper())
+        val parts = smsManager.divideMessage(message)
+        var pendingPartCount = parts.size.coerceAtLeast(1)
+        var firstErrorCode: Int? = null
+        var firstErrorMessage: String? = null
 
         fun finish(payload: Map<String, Any?>) {
             if (completed) {
                 return
             }
             completed = true
+            mainHandler.removeCallbacksAndMessages(null)
             try {
                 if (receiver != null) {
                     unregisterReceiver(receiver)
@@ -172,13 +178,21 @@ class MainActivity : FlutterActivity() {
                         else -> "Direct SMS failed with code $resultCode."
                     }
 
-                finish(
-                    mapOf(
-                        "success" to (resultCode == Activity.RESULT_OK),
-                        "errorCode" to resultCode,
-                        "errorMessage" to errorMessage,
-                    ),
-                )
+                if (resultCode != Activity.RESULT_OK && firstErrorCode == null) {
+                    firstErrorCode = resultCode
+                    firstErrorMessage = errorMessage
+                }
+
+                pendingPartCount -= 1
+                if (pendingPartCount <= 0) {
+                    finish(
+                        mapOf(
+                            "success" to (firstErrorCode == null),
+                            "errorCode" to firstErrorCode,
+                            "errorMessage" to firstErrorMessage,
+                        ),
+                    )
+                }
             }
         }
 
@@ -189,8 +203,47 @@ class MainActivity : FlutterActivity() {
             registerReceiver(receiver, IntentFilter(action))
         }
 
+        mainHandler.postDelayed(
+            {
+                finish(
+                    mapOf(
+                        "success" to false,
+                        "errorMessage" to "Timed out while waiting for SMS subsystem.",
+                    ),
+                )
+            },
+            25000,
+        )
+
         try {
-            smsManager.sendTextMessage(phoneNumber, null, message, sentPendingIntent, null)
+            if (parts.size <= 1) {
+                val sentPendingIntent = PendingIntent.getBroadcast(
+                    this,
+                    action.hashCode(),
+                    Intent(action),
+                    pendingIntentFlags,
+                )
+                smsManager.sendTextMessage(phoneNumber, null, message, sentPendingIntent, null)
+            } else {
+                val sentPendingIntents = ArrayList<PendingIntent>(parts.size)
+                repeat(parts.size) { index ->
+                    sentPendingIntents.add(
+                        PendingIntent.getBroadcast(
+                            this,
+                            action.hashCode() + index,
+                            Intent(action).apply { putExtra("partIndex", index) },
+                            pendingIntentFlags,
+                        ),
+                    )
+                }
+                smsManager.sendMultipartTextMessage(
+                    phoneNumber,
+                    null,
+                    ArrayList(parts),
+                    sentPendingIntents,
+                    null,
+                )
+            }
         } catch (e: Exception) {
             finish(
                 mapOf(
@@ -249,37 +302,77 @@ class MainActivity : FlutterActivity() {
         return if (level in 0..100) level else null
     }
 
-    private fun launchEmergencyCall(phoneNumber: String): Map<String, Any?> {
+    private fun saveRecordingToDownloads(
+        sourcePath: String,
+        displayName: String,
+    ): Map<String, Any?> {
         return try {
-            val hasCallPermission =
-                ContextCompat.checkSelfPermission(
-                    this,
-                    Manifest.permission.CALL_PHONE,
-                ) == PackageManager.PERMISSION_GRANTED
+            val sourceFile = File(sourcePath)
+            if (!sourceFile.exists()) {
+                return mapOf(
+                    "success" to false,
+                    "errorMessage" to "Source recording file not found.",
+                )
+            }
 
-            val action =
-                if (hasCallPermission) {
-                    Intent.ACTION_CALL
-                } else {
-                    Intent.ACTION_DIAL
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                val values =
+                    ContentValues().apply {
+                        put(MediaStore.MediaColumns.DISPLAY_NAME, displayName)
+                        put(MediaStore.MediaColumns.MIME_TYPE, "audio/mp4")
+                        put(MediaStore.MediaColumns.IS_PENDING, 1)
+                        put(
+                            MediaStore.MediaColumns.RELATIVE_PATH,
+                            "${Environment.DIRECTORY_DOWNLOADS}/SafeRoute/SOS_Recordings",
+                        )
+                    }
+
+                val resolver = applicationContext.contentResolver
+                val uri =
+                    resolver.insert(MediaStore.Downloads.EXTERNAL_CONTENT_URI, values)
+                        ?: return mapOf(
+                            "success" to false,
+                            "errorMessage" to "Unable to create destination file.",
+                        )
+
+                FileInputStream(sourceFile).use { input ->
+                    resolver.openOutputStream(uri)?.use { output ->
+                        input.copyTo(output)
+                    } ?: return mapOf(
+                        "success" to false,
+                        "errorMessage" to "Unable to open download destination.",
+                    )
                 }
 
-            val intent =
-                Intent(action).apply {
-                    data = android.net.Uri.parse("tel:$phoneNumber")
-                    addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                values.clear()
+                values.put(MediaStore.MediaColumns.IS_PENDING, 0)
+                resolver.update(uri, values, null, null)
+
+                mapOf(
+                    "success" to true,
+                    "publicPath" to "Download/SafeRoute/SOS_Recordings/$displayName",
+                )
+            } else {
+                val targetDir =
+                    File(
+                        Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS),
+                        "SafeRoute/SOS_Recordings",
+                    )
+                if (!targetDir.exists()) {
+                    targetDir.mkdirs()
                 }
-            startActivity(intent)
-            mapOf(
-                "success" to true,
-                "usedActionCall" to hasCallPermission,
-                "errorMessage" to null,
-            )
+
+                val targetFile = File(targetDir, displayName)
+                sourceFile.copyTo(targetFile, overwrite = true)
+                mapOf(
+                    "success" to true,
+                    "publicPath" to targetFile.absolutePath,
+                )
+            }
         } catch (e: Exception) {
             mapOf(
                 "success" to false,
-                "usedActionCall" to false,
-                "errorMessage" to (e.message ?: "Failed to launch emergency call."),
+                "errorMessage" to (e.message ?: "Failed to save recording to Downloads."),
             )
         }
     }

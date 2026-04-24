@@ -9,18 +9,23 @@ import 'package:vibration/vibration.dart';
 import '../services/location_service.dart';
 import 'package:cloud_firestore/cloud_firestore.dart';
 import 'package:firebase_auth/firebase_auth.dart';
-import 'package:url_launcher/url_launcher.dart';
 import 'package:flutter_background_service/flutter_background_service.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 import 'package:permission_handler/permission_handler.dart';
 import 'contact_controller.dart';
 import 'history_controller.dart';
 import 'rescue_invite_controller.dart';
-import 'sos_call_controller.dart';
 import 'sos_listener_controller.dart';
 import 'sos_settings_controller.dart';
 
 class SosController extends GetxController {
+  static SosController instanceOrCreate() {
+    if (Get.isRegistered<SosController>()) {
+      return Get.find<SosController>();
+    }
+    return Get.put(SosController(), permanent: true);
+  }
+
   static const int _sosFreshnessWindowMs = 15 * 60 * 1000;
   static const String _globalStatsDocPath = 'stats/global';
   static const Duration _smsSendGap = Duration(seconds: 3);
@@ -30,6 +35,16 @@ class SosController extends GetxController {
   static const MethodChannel _smsChannel = MethodChannel('safe_route/sms');
   static const String _preferredSmsSubscriptionPrefsKey =
       'preferred_sms_subscription_id';
+  static const String _voiceSosPrefsKey = 'is_voice_sos_active';
+  static const String _voiceStatusPrefsKey = 'voice_sos_status';
+  static const String _recordingStatusPrefsKey = 'sos_recording_status';
+  static const String _recordingPublicPathPrefsKey =
+      'sos_recording_public_path';
+  static const String _recordingActivePrefsKey = 'sos_recording_active';
+  static const String _sosPendingPrefsKey = 'is_sos_pending';
+  static const String _sosExecuteAtPrefsKey = 'sos_execute_at';
+  static const String _sosPendingOwnerPrefsKey = 'sos_pending_owner';
+  static const String _sosActivePrefsKey = 'is_sos_active';
 
   var isLoading = false.obs;
   var isCountdown = false.obs;
@@ -40,6 +55,12 @@ class SosController extends GetxController {
   var isSendingEmergencyAlerts = false.obs;
 
   var isShakeSOSActive = false.obs;
+  var isVoiceSOSActive = false.obs;
+  var isVoiceListening = false.obs;
+  var voiceStatusMessage = 'Voice SOS disabled'.obs;
+  var isEmergencyRecording = false.obs;
+  var recordingStatusMessage = ''.obs;
+  var lastRecordingPublicPath = ''.obs;
   var smsStatusMessage = 'SOS idle'.obs;
   var smsRetryStatus = ''.obs;
   var smsSentCount = 0.obs;
@@ -50,14 +71,34 @@ class SosController extends GetxController {
 
   String generatedMessage = '';
   Timer? _timer;
-  Timer? _fallbackCallTimer;
+  StreamSubscription<Map<String, dynamic>?>? _voiceStatusSubscription;
+  StreamSubscription<Map<String, dynamic>?>? _recordingStatusSubscription;
 
   @override
   void onInit() {
     super.onInit();
     _loadPrefs();
-    FlutterBackgroundService().on('sos_triggered').listen((event) {
+    _voiceStatusSubscription = FlutterBackgroundService()
+        .on('voice_sos_status')
+        .listen((event) {
+          final data = Map<String, dynamic>.from(event ?? const {});
+          voiceStatusMessage.value =
+              data['status']?.toString() ?? 'Voice SOS disabled';
+          isVoiceListening.value = data['isActive'] == true;
+        });
+    _recordingStatusSubscription = FlutterBackgroundService()
+        .on('sos_recording_status')
+        .listen((event) {
+          final data = Map<String, dynamic>.from(event ?? const {});
+          recordingStatusMessage.value = data['status']?.toString() ?? '';
+          isEmergencyRecording.value = data['isActive'] == true;
+          lastRecordingPublicPath.value =
+              data['publicPath']?.toString() ?? lastRecordingPublicPath.value;
+        });
+    FlutterBackgroundService().on('sos_triggered').listen((event) async {
       if (!isCountdown.value && !isSent.value) {
+        final prefs = await SharedPreferences.getInstance();
+        await prefs.setString(_sosPendingOwnerPrefsKey, 'ui');
         final executeAt = event?['executeAt'];
         if (executeAt is int) {
           final remainder =
@@ -74,13 +115,24 @@ class SosController extends GetxController {
   Future<void> _loadPrefs() async {
     final prefs = await SharedPreferences.getInstance();
     isShakeSOSActive.value = prefs.getBool('is_shake_active') ?? false;
+    isVoiceSOSActive.value = prefs.getBool(_voiceSosPrefsKey) ?? false;
+    isEmergencyRecording.value =
+        prefs.getBool(_recordingActivePrefsKey) ?? false;
+    voiceStatusMessage.value =
+        prefs.getString(_voiceStatusPrefsKey) ?? 'Voice SOS disabled';
+    recordingStatusMessage.value =
+        prefs.getString(_recordingStatusPrefsKey) ?? '';
+    lastRecordingPublicPath.value =
+        prefs.getString(_recordingPublicPathPrefsKey) ?? '';
     generatedMessage = prefs.getString('sos_msg') ?? '';
     selectedSmsSubscriptionId.value = prefs.getInt(
       _preferredSmsSubscriptionPrefsKey,
     );
+    isActiveBroadcast.value = prefs.getBool(_sosActivePrefsKey) ?? false;
 
     final uid = FirebaseAuth.instance.currentUser?.uid;
     if (uid != null) {
+      await prefs.setString('user_uid', uid);
       try {
         final doc = await FirebaseFirestore.instance
             .collection('active_sos')
@@ -99,18 +151,13 @@ class SosController extends GetxController {
           if (isFresh) {
             isSent.value = true;
             isActiveBroadcast.value = true;
-            if (Get.isRegistered<SosCallController>()) {
-              unawaited(
-                SosCallController.instance.restoreActiveSessionIfNeeded(
-                  sessionId: uid,
-                ),
-              );
-            }
+            await prefs.setBool(_sosActivePrefsKey, true);
           } else {
             await FirebaseFirestore.instance
                 .collection('active_sos')
                 .doc(uid)
                 .delete();
+            await prefs.setBool(_sosActivePrefsKey, false);
           }
         }
       } catch (e) {
@@ -118,10 +165,10 @@ class SosController extends GetxController {
       }
     }
 
-    bool isPending = prefs.getBool('is_sos_pending') ?? false;
+    final isPending = prefs.getBool(_sosPendingPrefsKey) ?? false;
     if (isPending) {
-      int targetTime = prefs.getInt('sos_execute_at') ?? 0;
-      int remainder =
+      final targetTime = prefs.getInt(_sosExecuteAtPrefsKey) ?? 0;
+      final remainder =
           ((targetTime - DateTime.now().millisecondsSinceEpoch) / 1000).ceil();
 
       if (remainder > 0 && remainder <= 10) {
@@ -131,11 +178,13 @@ class SosController extends GetxController {
           _showCancelDialogAggressive();
         });
       } else {
-        await prefs.setBool('is_sos_pending', false);
+        await prefs.setBool(_sosPendingPrefsKey, false);
+        await prefs.remove(_sosPendingOwnerPrefsKey);
       }
     }
 
     await refreshSmsSubscriptions();
+    await _syncBackgroundMonitoringService();
   }
 
   void _showCancelDialogAggressive() {
@@ -195,11 +244,12 @@ class SosController extends GetxController {
   @override
   void onClose() {
     _timer?.cancel();
-    _fallbackCallTimer?.cancel();
+    _voiceStatusSubscription?.cancel();
+    _recordingStatusSubscription?.cancel();
     super.onClose();
   }
 
-  void toggleShakeSOS(bool value) async {
+  Future<void> toggleShakeSOS(bool value) async {
     isShakeSOSActive.value = value;
 
     final prefs = await SharedPreferences.getInstance();
@@ -210,27 +260,93 @@ class SosController extends GetxController {
       await prefs.setString('user_uid', uid);
     }
 
-    final service = FlutterBackgroundService();
-    var isRunning = await service.isRunning();
-
     if (value) {
+      if (await Permission.notification.isDenied) {
+        await Permission.notification.request();
+      }
+      if (await Permission.locationWhenInUse.isDenied) {
+        await Permission.locationWhenInUse.request();
+      }
+      if (await Permission.locationAlways.isDenied) {
+        await Permission.locationAlways.request();
+      }
       if (await Permission.ignoreBatteryOptimizations.isDenied) {
         await Permission.ignoreBatteryOptimizations.request();
       }
       if (await Permission.systemAlertWindow.isDenied) {
         await Permission.systemAlertWindow.request();
       }
-      if (!isRunning) {
-        await service.startService();
+    }
+
+    await _syncBackgroundMonitoringService();
+  }
+
+  Future<void> toggleVoiceSOS(bool value) async {
+    final prefs = await SharedPreferences.getInstance();
+    if (value) {
+      if (await Permission.notification.isDenied) {
+        await Permission.notification.request();
       }
-    } else {
-      if (isRunning) {
-        service.invoke("stopService");
+      if (await Permission.locationWhenInUse.isDenied) {
+        await Permission.locationWhenInUse.request();
       }
+      if (await Permission.locationAlways.isDenied) {
+        await Permission.locationAlways.request();
+      }
+      final micStatus = await Permission.microphone.request();
+      if (!micStatus.isGranted) {
+        isVoiceSOSActive.value = false;
+        voiceStatusMessage.value = 'Microphone permission required';
+        await prefs.setBool(_voiceSosPrefsKey, false);
+        Get.snackbar(
+          'Voice SOS Disabled',
+          'Microphone permission is required for voice keyword detection.',
+          snackPosition: SnackPosition.BOTTOM,
+        );
+        return;
+      }
+    }
+
+    isVoiceSOSActive.value = value;
+    await prefs.setBool(_voiceSosPrefsKey, value);
+
+    final uid = FirebaseAuth.instance.currentUser?.uid;
+    if (uid != null) {
+      await prefs.setString('user_uid', uid);
+    }
+
+    await _syncBackgroundMonitoringService();
+    final service = FlutterBackgroundService();
+    if (await service.isRunning()) {
+      service.invoke('setShakeSosEnabled', {'enabled': isShakeSOSActive.value});
+      service.invoke('setVoiceSosEnabled', {'enabled': value});
     }
   }
 
-  void initiateSOSWorkflow({int? initialCountdown}) async {
+  Future<void> _syncBackgroundMonitoringService() async {
+    final service = FlutterBackgroundService();
+    final isRunning = await service.isRunning();
+    final shouldRun =
+        isShakeSOSActive.value ||
+        isVoiceSOSActive.value ||
+        isEmergencyRecording.value ||
+        isActiveBroadcast.value;
+
+    if (shouldRun && !isRunning) {
+      await service.startService();
+      await Future<void>.delayed(const Duration(milliseconds: 400));
+    } else if (!shouldRun && isRunning) {
+      service.invoke("stopService");
+      return;
+    }
+
+    if (await service.isRunning()) {
+      service.invoke('setShakeSosEnabled', {'enabled': isShakeSOSActive.value});
+      service.invoke('setVoiceSosEnabled', {'enabled': isVoiceSOSActive.value});
+    }
+  }
+
+  Future<void> initiateSOSWorkflow({int? initialCountdown}) async {
     if (isLoading.value ||
         isSendingEmergencyAlerts.value ||
         isCountdown.value ||
@@ -244,20 +360,26 @@ class SosController extends GetxController {
     }
 
     final settings = SosSettingsController.instanceOrCreate();
+    final prefs = await SharedPreferences.getInstance();
     countdownSeconds.value =
         initialCountdown ?? settings.activationDelaySeconds.value;
     isSent.value = false;
+    await prefs.setString(_sosPendingOwnerPrefsKey, 'ui');
 
     if (countdownSeconds.value <= 0) {
       isCountdown.value = false;
+      await prefs.setBool(_sosPendingPrefsKey, false);
+      await prefs.remove(_sosExecuteAtPrefsKey);
       await executeSOS();
       return;
     }
 
     isCountdown.value = true;
-
-    final prefs = await SharedPreferences.getInstance();
-    await prefs.setBool('is_sos_pending', true);
+    final executeAt = DateTime.now()
+        .add(Duration(seconds: countdownSeconds.value))
+        .millisecondsSinceEpoch;
+    await prefs.setBool(_sosPendingPrefsKey, true);
+    await prefs.setInt(_sosExecuteAtPrefsKey, executeAt);
 
     _timer?.cancel();
     _timer = Timer.periodic(const Duration(seconds: 1), (timer) {
@@ -294,19 +416,20 @@ class SosController extends GetxController {
         'deviationMeters': deviationMeters,
       },
     );
-    initiateSOSWorkflow(initialCountdown: 0);
+    await initiateSOSWorkflow(initialCountdown: 0);
     return true;
   }
 
   Future<void> cancelSOS() async {
     final settings = SosSettingsController.instanceOrCreate();
     _timer?.cancel();
-    _fallbackCallTimer?.cancel();
     isCountdown.value = false;
     countdownSeconds.value = settings.activationDelaySeconds.value;
 
     final prefs = await SharedPreferences.getInstance();
-    await prefs.setBool('is_sos_pending', false);
+    await prefs.setBool(_sosPendingPrefsKey, false);
+    await prefs.remove(_sosExecuteAtPrefsKey);
+    await prefs.remove(_sosPendingOwnerPrefsKey);
   }
 
   Future<void> executeSOS() async {
@@ -319,6 +442,37 @@ class SosController extends GetxController {
     _resetSmsStatus();
 
     try {
+      final prefs = await SharedPreferences.getInstance();
+      await prefs.setBool(_sosPendingPrefsKey, false);
+      await prefs.remove(_sosExecuteAtPrefsKey);
+      await prefs.remove(_sosPendingOwnerPrefsKey);
+
+      final uid = FirebaseAuth.instance.currentUser?.uid;
+      if (uid == null || uid.isEmpty) {
+        throw Exception('No active user found.');
+      }
+      await prefs.setString('user_uid', uid);
+
+      final existingSession = await FirebaseFirestore.instance
+          .collection('active_sos')
+          .doc(uid)
+          .get();
+      if (existingSession.exists &&
+          existingSession.data()?['active'] == true &&
+          existingSession.data()?['status'] != 'completed') {
+        isLoading.value = false;
+        isSent.value = true;
+        isActiveBroadcast.value = true;
+        await prefs.setBool(_sosActivePrefsKey, true);
+        await _syncBackgroundMonitoringService();
+        Get.snackbar(
+          'SOS Already Active',
+          'Your emergency session is already running.',
+          snackPosition: SnackPosition.BOTTOM,
+        );
+        return;
+      }
+
       final position = await LocationService.getCurrentPosition();
       final lat = position.latitude.toStringAsFixed(6);
       final lng = position.longitude.toStringAsFixed(6);
@@ -337,7 +491,6 @@ class SosController extends GetxController {
       }
 
       // Broadcast SOS to nearby users via Firestore
-      final uid = FirebaseAuth.instance.currentUser?.uid ?? 'unknown';
       final nowMs = DateTime.now().millisecondsSinceEpoch;
       try {
         await FirebaseFirestore.instance.collection('active_sos').doc(uid).set({
@@ -372,12 +525,6 @@ class SosController extends GetxController {
           colorText: Colors.white,
           duration: const Duration(seconds: 4),
         );
-
-        _fallbackCallTimer?.cancel();
-        _fallbackCallTimer = Timer(
-          const Duration(minutes: 5),
-          () => _triggerFallbackCall(uid),
-        );
       } catch (e) {
         debugPrint("Error broadcasting SOS: \$e");
       }
@@ -385,21 +532,16 @@ class SosController extends GetxController {
       isLoading.value = false;
       isSent.value = true;
       isActiveBroadcast.value = true;
+      await prefs.setBool(_sosActivePrefsKey, true);
+      await _syncBackgroundMonitoringService();
+      final backgroundService = FlutterBackgroundService();
+      if (await backgroundService.isRunning()) {
+        backgroundService.invoke('startSosRecording', {'sessionId': uid});
+      }
       await HistoryController.instanceOrCreate().recordSos(
         status: 'Sent',
         locationLabel: 'Emergency SOS dispatched',
       );
-
-      if (Get.isRegistered<SosCallController>()) {
-        unawaited(
-          SosCallController.instance.startParallelCallingForSos(
-            sessionId: uid,
-            emergencyContacts: contactsList,
-            latitude: position.latitude,
-            longitude: position.longitude,
-          ),
-        );
-      }
 
       unawaited(
         _dispatchEmergencySmsInBackground(
@@ -411,6 +553,8 @@ class SosController extends GetxController {
         ),
       );
     } catch (e) {
+      final prefs = await SharedPreferences.getInstance();
+      await prefs.setBool(_sosActivePrefsKey, false);
       isLoading.value = false;
       smsStatusMessage.value = 'Emergency sending failed';
       String errorMsg = e.toString().replaceFirst('Exception: ', '');
@@ -1030,6 +1174,24 @@ class SosController extends GetxController {
     generatedMessage = '';
   }
 
+  Future<void> _clearLocalSosState() async {
+    isSent.value = false;
+    isActiveBroadcast.value = false;
+    isEmergencyRecording.value = false;
+    generatedMessage = '';
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setBool(_sosActivePrefsKey, false);
+    await prefs.setBool(_sosPendingPrefsKey, false);
+    await prefs.remove(_sosExecuteAtPrefsKey);
+    await prefs.remove(_sosPendingOwnerPrefsKey);
+    final backgroundService = FlutterBackgroundService();
+    if (await backgroundService.isRunning()) {
+      backgroundService.invoke('stopSosRecording');
+    }
+    await _syncBackgroundMonitoringService();
+    SosListenerController.instance.clearActiveNavigation();
+  }
+
   Future<void> stopActiveSOS() async {
     if (isCompletingRescue.value) {
       return;
@@ -1053,16 +1215,16 @@ class SosController extends GetxController {
       await FirebaseFirestore.instance.runTransaction((transaction) async {
         final sessionSnapshot = await transaction.get(sessionRef);
         if (!sessionSnapshot.exists) {
-          throw Exception('SOS session not found.');
+          return;
         }
 
         final sessionData = sessionSnapshot.data() ?? <String, dynamic>{};
         final status = sessionData['status']?.toString();
         if (status == 'completed') {
-          throw Exception('This rescue has already been completed.');
+          return;
         }
         if (sessionData['active'] != true || status != 'active') {
-          throw Exception('Only an active SOS can be marked as safe.');
+          return;
         }
 
         final victim = sessionData['victim'];
@@ -1111,11 +1273,7 @@ class SosController extends GetxController {
         }
       });
 
-      _fallbackCallTimer?.cancel();
-      isSent.value = false;
-      isActiveBroadcast.value = false;
-      generatedMessage = '';
-      SosListenerController.instance.clearActiveNavigation();
+      await _clearLocalSosState();
       await HistoryController.instanceOrCreate().recordSos(
         status: 'Completed',
         locationLabel: 'Rescue successfully completed',
@@ -1128,18 +1286,13 @@ class SosController extends GetxController {
         backgroundColor: Colors.green,
         colorText: Colors.white,
       );
-
-      if (Get.isRegistered<SosCallController>()) {
-        unawaited(
-          SosCallController.instance.handleSafeConfirmed(sessionId: uid),
-        );
-      }
     } catch (e) {
       debugPrint("Error stopping SOS: \$e");
+      await _clearLocalSosState();
       Get.snackbar(
-        "Error",
-        "Failed to complete rescue. Please try again.",
-        backgroundColor: Colors.redAccent,
+        "SOS Stopped Locally",
+        "The app cleared the emergency session locally. Sync may finish when connectivity returns.",
+        backgroundColor: Colors.orange,
         colorText: Colors.white,
       );
     } finally {
@@ -1168,46 +1321,8 @@ class SosController extends GetxController {
           'updatedAtMs': nowMs,
         },
       );
-      if (Get.isRegistered<SosCallController>()) {
-        unawaited(
-          SosCallController.instance.syncLocation(
-            sessionId: uid,
-            latitude: position.latitude,
-            longitude: position.longitude,
-          ),
-        );
-      }
     } catch (e) {
       debugPrint("Failed to update victim location: $e");
-    }
-  }
-
-  Future<void> _triggerFallbackCall(String uid) async {
-    try {
-      final doc = await FirebaseFirestore.instance
-          .collection('active_sos')
-          .doc(uid)
-          .get();
-      if (doc.exists) {
-        final data = doc.data() as Map<String, dynamic>;
-        final responders = data['responders'] as List<dynamic>? ?? [];
-        if (responders.isEmpty) {
-          final contactCtrl = Get.isRegistered<ContactController>()
-              ? Get.find<ContactController>()
-              : ContactController.instanceOrCreate();
-          if (contactCtrl.contacts.isNotEmpty) {
-            final number = contactCtrl.contacts.first;
-            final Uri telUri = Uri(scheme: 'tel', path: number);
-            if (await canLaunchUrl(telUri)) {
-              await launchUrl(telUri);
-            } else {
-              debugPrint('Could not launch \$telUri');
-            }
-          }
-        }
-      }
-    } catch (e) {
-      debugPrint("Fallback Call Error: \$e");
     }
   }
 

@@ -1,6 +1,5 @@
 import 'dart:async';
 import 'dart:math';
-import 'package:permission_handler/permission_handler.dart';
 import 'package:flutter/material.dart';
 import 'package:cloud_firestore/cloud_firestore.dart';
 import 'package:firebase_auth/firebase_auth.dart';
@@ -8,13 +7,14 @@ import 'package:flutter_map/flutter_map.dart';
 import 'package:latlong2/latlong.dart';
 import 'package:geolocator/geolocator.dart';
 import 'package:get/get.dart';
+import 'package:shared_preferences/shared_preferences.dart';
 import '../services/location_service.dart';
 import '../controllers/sos_controller.dart';
 import '../controllers/heatmap_controller.dart';
 import '../controllers/history_controller.dart';
 import '../controllers/rescue_invite_controller.dart';
 import '../controllers/rescue_stats_controller.dart';
-import '../controllers/sos_call_controller.dart';
+import '../services/journey_safety_service.dart';
 import '../services/routing_service.dart';
 import '../controllers/sos_listener_controller.dart';
 import '../screens/safe_route_menu_screens.dart';
@@ -30,15 +30,28 @@ class MapScreen extends StatefulWidget {
 
 class _MapScreenState extends State<MapScreen> {
   static const double _unsafeZoneRadiusMeters = 150;
+  static const double _unsafeRouteBufferMeters = 70;
   static const double _responderRouteCacheDistanceMeters = 25;
   static const double _routeTapThresholdMeters = 40;
   static const double _publishDistanceThresholdMeters = 10;
   static const double _journeyDeviationThresholdMeters = 50;
   static const double _journeyArrivalThresholdMeters = 30;
+  static const double _journeyAutoSosRiskThreshold = 45;
+  static const Duration _journeyRouteRefreshCooldown = Duration(seconds: 15);
+  static const String _journeyGuardEnabledPrefsKey = 'journey_guard_enabled';
+  static const String _journeyGuardActivePrefsKey = 'journey_guard_active';
+  static const String _journeyGuardSelectingPrefsKey =
+      'journey_guard_selecting_destination';
+  static const String _journeyDestinationLatPrefsKey =
+      'journey_guard_destination_lat';
+  static const String _journeyDestinationLngPrefsKey =
+      'journey_guard_destination_lng';
   final MapController _mapController = MapController();
-  final SosController _sosController = Get.put(SosController());
-  final HeatmapController _heatmapController = Get.put(HeatmapController());
-  final SosCallController _sosCallController = Get.find<SosCallController>();
+  final SosController _sosController = SosController.instanceOrCreate();
+  final HeatmapController _heatmapController =
+      Get.isRegistered<HeatmapController>()
+      ? Get.find<HeatmapController>()
+      : Get.put(HeatmapController(), permanent: true);
   final SosHeatmapController _sosHeatmapController = Get.put(
     SosHeatmapController(),
   );
@@ -50,6 +63,9 @@ class _MapScreenState extends State<MapScreen> {
 
   List<LatLng> _sosRouteLocations = [];
   RouteSummary? _activeRouteSummary;
+  RouteSummary? _journeyRouteSummary;
+  JourneyRiskResult? _journeyRiskResult;
+  String? _journeyWarningMessage;
   String? _selectedUnsafeZoneId;
   String? _lastRouteHistoryKey;
   String? _selectedResponderUid;
@@ -58,25 +74,27 @@ class _MapScreenState extends State<MapScreen> {
   _sessionSubscription;
   Worker? _broadcastWorker;
   Worker? _rescueWorker;
-  Worker? _callWorker;
+  Worker? _unsafeZonesWorker;
   final Map<String, _ResponderRouteInfo> _responderRoutes = {};
   final Map<String, _CachedResponderRoute> _routeCache = {};
   Worker? _sosWorker;
   StreamSubscription<Position>? _positionStreamSubscription;
   LatLng? _lastPublishedVictimLocation;
   LatLng? _lastPublishedResponderLocation;
-  bool _isPostSafeSheetVisible = false;
+  bool _isJourneyGuardEnabled = false;
   bool _isSelectingJourneyDestination = false;
   bool _isJourneyActive = false;
   bool _hasAutoSosTriggered = false;
   LatLng? _journeyDestination;
   List<LatLng> _journeyRouteLocations = [];
   double? _journeyDeviationMeters;
+  double? _lastJourneyRiskScore;
+  DateTime? _lastJourneyRouteRefreshAt;
 
   @override
   void initState() {
     super.initState();
-    Permission.microphone.request();
+    unawaited(_restoreJourneyGuardState());
     _fetchCurrentLocation();
     _startLocationTracking(); // Real-time continuous stream
     _bindActiveSessionTracking();
@@ -86,11 +104,22 @@ class _MapScreenState extends State<MapScreen> {
     _rescueWorker = ever(SosListenerController.instance.activeSosUid, (_) {
       _bindActiveSessionTracking();
     });
-    _callWorker = ever(_sosCallController.showPostSafeActions, (bool show) {
-      if (show && !_isPostSafeSheetVisible) {
-        _showPostSafeActionsSheet();
-      }
-    });
+    _unsafeZonesWorker = ever<List<UnsafeZone>>(
+      _heatmapController.unsafeZones,
+      (zones) {
+        if (_isJourneyGuardEnabled &&
+            _journeyDestination != null &&
+            _currentPosition != null) {
+          unawaited(
+            _setJourneyDestination(
+              _journeyDestination!,
+              preserveJourneyState: _isJourneyActive,
+              logHistory: false,
+            ),
+          );
+        }
+      },
+    );
 
     _sosWorker = ever(SosListenerController.instance.activeSosTarget, (
       LatLng? target,
@@ -99,6 +128,7 @@ class _MapScreenState extends State<MapScreen> {
         _drawRouteTo(target);
       } else if (target == null) {
         RescueInviteController.instance.clearInviteJoinBadge();
+        if (!mounted) return;
         setState(() {
           _sosRouteLocations.clear();
           _activeRouteSummary = null;
@@ -112,7 +142,7 @@ class _MapScreenState extends State<MapScreen> {
     _sosWorker?.dispose();
     _broadcastWorker?.dispose();
     _rescueWorker?.dispose();
-    _callWorker?.dispose();
+    _unsafeZonesWorker?.dispose();
     _sessionSubscription?.cancel();
     _positionStreamSubscription?.cancel();
     super.dispose();
@@ -134,7 +164,10 @@ class _MapScreenState extends State<MapScreen> {
             });
 
             final currentLatLng = LatLng(position.latitude, position.longitude);
-            _evaluateJourneyProgress(currentLatLng);
+            if (_isJourneyGuardEnabled) {
+              unawaited(_riskController.updateRisk(currentLatLng));
+              _evaluateJourneyProgress(currentLatLng);
+            }
 
             if (_sosController.isActiveBroadcast.value &&
                 _shouldPublishLocation(
@@ -199,6 +232,7 @@ class _MapScreenState extends State<MapScreen> {
   }
 
   Future<void> _fetchCurrentLocation() async {
+    if (!mounted) return;
     setState(() {
       _isLoading = true;
       _errorMessage = null;
@@ -206,13 +240,20 @@ class _MapScreenState extends State<MapScreen> {
 
     try {
       final position = await LocationService.getCurrentPosition();
+      if (!mounted) return;
       bool isFirstLoad = _currentPosition == null;
       setState(() {
         _currentPosition = position;
         _isLoading = false;
       });
 
-      _riskController.startPolling(position);
+      if (_isJourneyGuardEnabled) {
+        _riskController.startPolling(position);
+        unawaited(_restoreJourneyRouteIfNeeded());
+      } else {
+        _riskController.stopPolling();
+        _riskController.currentRiskScore.value = null;
+      }
 
       if (!isFirstLoad) {
         _moveCameraTo(position);
@@ -222,6 +263,7 @@ class _MapScreenState extends State<MapScreen> {
         _drawRouteTo(SosListenerController.instance.activeSosTarget.value!);
       }
     } catch (e) {
+      if (!mounted) return;
       setState(() {
         _errorMessage = e.toString().replaceFirst('Exception: ', '');
         _isLoading = false;
@@ -386,23 +428,36 @@ class _MapScreenState extends State<MapScreen> {
   }
 
   void _enableJourneyDestinationSelection() {
+    if (!_isJourneyGuardEnabled) {
+      _showInfoSnackBar('Turn on Journey Guard first.');
+      return;
+    }
     setState(() {
       _isSelectingJourneyDestination = true;
     });
+    unawaited(_persistJourneyGuardState());
     _showInfoSnackBar('Tap on map to choose destination');
   }
 
-  Future<void> _setJourneyDestination(LatLng destination) async {
+  Future<void> _setJourneyDestination(
+    LatLng destination, {
+    bool preserveJourneyState = false,
+    bool logHistory = true,
+  }) async {
+    if (!_isJourneyGuardEnabled) {
+      return;
+    }
     if (_currentPosition == null) {
       _showErrorSnackBar('Current location unavailable.');
       return;
     }
 
     try {
-      final route = await RoutingService.getRoute(
+      final journeyDecision = await _buildSafeJourneyRoute(
         LatLng(_currentPosition!.latitude, _currentPosition!.longitude),
         destination,
       );
+      final route = journeyDecision.route;
       if (!mounted) return;
       if (route.points.isEmpty) {
         _showErrorSnackBar('Unable to build route for selected destination.');
@@ -412,27 +467,48 @@ class _MapScreenState extends State<MapScreen> {
       setState(() {
         _journeyDestination = destination;
         _journeyRouteLocations = route.points;
+        _journeyRouteSummary = route;
+        _journeyRiskResult = JourneySafetyService.calculateRouteRisk(
+          route.points,
+          _heatmapController.unsafeZones,
+          userLocation: LatLng(
+            _currentPosition!.latitude,
+            _currentPosition!.longitude,
+          ),
+          dangerBufferMeters:
+              _unsafeZoneRadiusMeters + _unsafeRouteBufferMeters,
+        );
+        _lastJourneyRiskScore = _journeyRiskResult?.score;
+        _journeyWarningMessage = journeyDecision.warningMessage;
         _journeyDeviationMeters = null;
-        _isJourneyActive = false;
+        _isJourneyActive = preserveJourneyState;
         _hasAutoSosTriggered = false;
+        _lastJourneyRouteRefreshAt = DateTime.now();
       });
-      unawaited(
-        HistoryController.instanceOrCreate().recordJourneyEvent(
-          title: 'Journey Route Ready',
-          subtitle:
-              'Distance ${_formatDistance(route.distanceMeters)} - ${_formatDuration(route.durationSeconds)}',
-          metadata: {
-            'destinationLat': destination.latitude,
-            'destinationLng': destination.longitude,
-          },
-        ),
-      );
+      await _persistJourneyGuardState();
+      if (logHistory) {
+        unawaited(
+          HistoryController.instanceOrCreate().recordJourneyEvent(
+            title: 'Journey Route Ready',
+            subtitle:
+                'Distance ${_formatDistance(route.distanceMeters)} - ${_formatDuration(route.durationSeconds)}',
+            metadata: {
+              'destinationLat': destination.latitude,
+              'destinationLng': destination.longitude,
+            },
+          ),
+        );
+      }
     } catch (_) {
-      _showErrorSnackBar('Failed to fetch shortest route.');
+      _showErrorSnackBar('Failed to fetch safer route.');
     }
   }
 
   void _startJourney() {
+    if (!_isJourneyGuardEnabled) {
+      _showInfoSnackBar('Turn on Journey Guard first.');
+      return;
+    }
     if (_journeyRouteLocations.length < 2) {
       _showErrorSnackBar('Select a destination and route first.');
       return;
@@ -441,6 +517,10 @@ class _MapScreenState extends State<MapScreen> {
       _isJourneyActive = true;
       _hasAutoSosTriggered = false;
     });
+    if (_currentPosition != null) {
+      _riskController.startPolling(_currentPosition!);
+    }
+    unawaited(_persistJourneyGuardState());
     unawaited(
       HistoryController.instanceOrCreate().recordJourneyEvent(
         title: 'Journey Started',
@@ -453,6 +533,7 @@ class _MapScreenState extends State<MapScreen> {
   }
 
   void _endJourney({bool showMessage = true}) {
+    if (!mounted) return;
     final wasActive = _isJourneyActive;
     setState(() {
       _isJourneyActive = false;
@@ -460,8 +541,14 @@ class _MapScreenState extends State<MapScreen> {
       _hasAutoSosTriggered = false;
       _journeyDestination = null;
       _journeyRouteLocations.clear();
+      _journeyRouteSummary = null;
+      _journeyRiskResult = null;
+      _journeyWarningMessage = null;
+      _lastJourneyRiskScore = null;
       _journeyDeviationMeters = null;
+      _lastJourneyRouteRefreshAt = null;
     });
+    unawaited(_persistJourneyGuardState());
     if (wasActive) {
       unawaited(
         HistoryController.instanceOrCreate().recordJourneyEvent(
@@ -476,7 +563,9 @@ class _MapScreenState extends State<MapScreen> {
   }
 
   void _evaluateJourneyProgress(LatLng current) {
-    if (!_isJourneyActive || _journeyRouteLocations.length < 2) {
+    if (!_isJourneyGuardEnabled ||
+        !_isJourneyActive ||
+        _journeyRouteLocations.length < 2) {
       return;
     }
 
@@ -505,7 +594,63 @@ class _MapScreenState extends State<MapScreen> {
       }
     }
 
-    if (deviation > _journeyDeviationThresholdMeters && !_hasAutoSosTriggered) {
+    final updatedRisk = JourneySafetyService.calculateRouteRisk(
+      _journeyRouteLocations,
+      _heatmapController.unsafeZones,
+      userLocation: current,
+      dangerBufferMeters: _unsafeZoneRadiusMeters + _unsafeRouteBufferMeters,
+    );
+    if (mounted) {
+      setState(() {
+        _journeyRiskResult = updatedRisk;
+        if (updatedRisk.intersectsDangerZone) {
+          _journeyWarningMessage =
+              'No fully safe route available. Showing lowest-risk route.';
+        }
+      });
+    }
+
+    if (_lastJourneyRiskScore != null &&
+        (updatedRisk.score - _lastJourneyRiskScore!).abs() >= 12 &&
+        _journeyDestination != null) {
+      _lastJourneyRiskScore = updatedRisk.score;
+      _lastJourneyRouteRefreshAt = DateTime.now();
+      unawaited(
+        _setJourneyDestination(
+          _journeyDestination!,
+          preserveJourneyState: true,
+          logHistory: false,
+        ),
+      );
+      return;
+    }
+    _lastJourneyRiskScore = updatedRisk.score;
+
+    final shouldRefreshRouteForDeviation =
+        deviation > (_journeyDeviationThresholdMeters * 0.6) &&
+        _journeyDestination != null &&
+        (_lastJourneyRouteRefreshAt == null ||
+            DateTime.now().difference(_lastJourneyRouteRefreshAt!) >=
+                _journeyRouteRefreshCooldown);
+
+    if (shouldRefreshRouteForDeviation) {
+      _lastJourneyRouteRefreshAt = DateTime.now();
+      unawaited(
+        _setJourneyDestination(
+          _journeyDestination!,
+          preserveJourneyState: true,
+          logHistory: false,
+        ),
+      );
+    }
+
+    final shouldAutoTrigger =
+        deviation > _journeyDeviationThresholdMeters &&
+        (updatedRisk.score >= _journeyAutoSosRiskThreshold ||
+            updatedRisk.intersectsDangerZone ||
+            updatedRisk.nearbyDangerCount > 0);
+
+    if (shouldAutoTrigger && !_hasAutoSosTriggered) {
       _hasAutoSosTriggered = true;
       _endJourney(showMessage: false);
       unawaited(() async {
@@ -530,7 +675,7 @@ class _MapScreenState extends State<MapScreen> {
     if (polyline.length < 2) return double.infinity;
     var nearestDistance = double.infinity;
     for (var i = 0; i < polyline.length - 1; i++) {
-      final distance = _distanceToSegmentMeters(
+      final distance = JourneySafetyService.distanceToSegmentMeters(
         point,
         polyline[i],
         polyline[i + 1],
@@ -549,8 +694,239 @@ class _MapScreenState extends State<MapScreen> {
     );
   }
 
+  Future<void> _restoreJourneyGuardState() async {
+    final prefs = await SharedPreferences.getInstance();
+    final enabled = prefs.getBool(_journeyGuardEnabledPrefsKey) ?? false;
+    final active = prefs.getBool(_journeyGuardActivePrefsKey) ?? false;
+    final selecting = prefs.getBool(_journeyGuardSelectingPrefsKey) ?? false;
+    final destinationLat = prefs.getDouble(_journeyDestinationLatPrefsKey);
+    final destinationLng = prefs.getDouble(_journeyDestinationLngPrefsKey);
+
+    if (!mounted) {
+      return;
+    }
+
+    setState(() {
+      _isJourneyGuardEnabled = enabled;
+      _isJourneyActive = enabled && active;
+      _isSelectingJourneyDestination =
+          enabled &&
+          selecting &&
+          destinationLat == null &&
+          destinationLng == null;
+      _journeyDestination =
+          enabled && destinationLat != null && destinationLng != null
+          ? LatLng(destinationLat, destinationLng)
+          : null;
+    });
+
+    if (_isJourneyGuardEnabled) {
+      if (_currentPosition != null) {
+        _riskController.startPolling(_currentPosition!);
+      }
+      await _restoreJourneyRouteIfNeeded();
+    } else {
+      _riskController.stopPolling();
+      _riskController.currentRiskScore.value = null;
+    }
+  }
+
+  Future<void> _persistJourneyGuardState() async {
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setBool(_journeyGuardEnabledPrefsKey, _isJourneyGuardEnabled);
+    await prefs.setBool(
+      _journeyGuardActivePrefsKey,
+      _isJourneyGuardEnabled && _isJourneyActive,
+    );
+    await prefs.setBool(
+      _journeyGuardSelectingPrefsKey,
+      _isJourneyGuardEnabled && _isSelectingJourneyDestination,
+    );
+
+    if (_isJourneyGuardEnabled && _journeyDestination != null) {
+      await prefs.setDouble(
+        _journeyDestinationLatPrefsKey,
+        _journeyDestination!.latitude,
+      );
+      await prefs.setDouble(
+        _journeyDestinationLngPrefsKey,
+        _journeyDestination!.longitude,
+      );
+    } else {
+      await prefs.remove(_journeyDestinationLatPrefsKey);
+      await prefs.remove(_journeyDestinationLngPrefsKey);
+    }
+  }
+
+  Future<void> _restoreJourneyRouteIfNeeded() async {
+    if (!_isJourneyGuardEnabled ||
+        _currentPosition == null ||
+        _journeyDestination == null) {
+      return;
+    }
+
+    if (_journeyRouteLocations.isNotEmpty) {
+      return;
+    }
+
+    await _setJourneyDestination(
+      _journeyDestination!,
+      preserveJourneyState: _isJourneyActive,
+      logHistory: false,
+    );
+  }
+
+  Future<void> _handleJourneyGuardToggle(bool enabled) async {
+    if (_isJourneyGuardEnabled == enabled) {
+      return;
+    }
+
+    if (!enabled) {
+      setState(() {
+        _isJourneyGuardEnabled = false;
+      });
+      _riskController.stopPolling();
+      _riskController.currentRiskScore.value = null;
+      _endJourney(showMessage: false);
+      await _persistJourneyGuardState();
+      _showInfoSnackBar('Journey Guard turned off.');
+      return;
+    }
+
+    setState(() {
+      _isJourneyGuardEnabled = true;
+      _isSelectingJourneyDestination = false;
+      _isJourneyActive = false;
+      _hasAutoSosTriggered = false;
+    });
+    if (_currentPosition == null) {
+      await _fetchCurrentLocation();
+      if (_currentPosition == null) {
+        if (!mounted) return;
+        setState(() {
+          _isJourneyGuardEnabled = false;
+        });
+        await _persistJourneyGuardState();
+        _showErrorSnackBar(
+          'Location permission is required to enable Journey Guard.',
+        );
+        return;
+      }
+    }
+    if (_currentPosition != null) {
+      _riskController.startPolling(_currentPosition!);
+      unawaited(
+        _riskController.updateRisk(
+          LatLng(_currentPosition!.latitude, _currentPosition!.longitude),
+        ),
+      );
+    }
+    await _persistJourneyGuardState();
+    _showInfoSnackBar(
+      'Journey Guard enabled. Choose a destination, then press Start Journey.',
+    );
+  }
+
+  Future<void> _showSafetyControlsSheet() async {
+    await showModalBottomSheet<void>(
+      context: context,
+      useSafeArea: true,
+      backgroundColor: Theme.of(context).colorScheme.surface,
+      shape: const RoundedRectangleBorder(
+        borderRadius: BorderRadius.vertical(top: Radius.circular(28)),
+      ),
+      builder: (context) {
+        return SafeArea(
+          child: Padding(
+            padding: const EdgeInsets.fromLTRB(20, 16, 20, 24),
+            child: Obx(
+              () => Column(
+                mainAxisSize: MainAxisSize.min,
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Center(
+                    child: Container(
+                      width: 44,
+                      height: 5,
+                      decoration: BoxDecoration(
+                        color: Theme.of(context).dividerColor,
+                        borderRadius: BorderRadius.circular(999),
+                      ),
+                    ),
+                  ),
+                  const SizedBox(height: 18),
+                  Text(
+                    'Safety Controls',
+                    style: Theme.of(context).textTheme.titleLarge?.copyWith(
+                      fontWeight: FontWeight.w700,
+                    ),
+                  ),
+                  const SizedBox(height: 6),
+                  Text(
+                    'Manage safety tools without crowding the map.',
+                    style: Theme.of(context).textTheme.bodyMedium?.copyWith(
+                      color: Theme.of(context).colorScheme.onSurfaceVariant,
+                    ),
+                  ),
+                  const SizedBox(height: 18),
+                  _ControlToggleTile(
+                    icon: Icons.shield_outlined,
+                    iconColor: Colors.amber.shade700,
+                    title: 'Journey Guard',
+                    subtitle:
+                        'Monitors deviation and nearby danger once you start a journey.',
+                    value: _isJourneyGuardEnabled,
+                    onChanged: _handleJourneyGuardToggle,
+                  ),
+                  const SizedBox(height: 10),
+                  _ControlToggleTile(
+                    icon: Icons.vibration,
+                    iconColor: Colors.deepPurpleAccent,
+                    title: 'Shake SOS',
+                    subtitle: 'Emergency shake trigger for hands-free SOS.',
+                    value: _sosController.isShakeSOSActive.value,
+                    onChanged: _sosController.toggleShakeSOS,
+                  ),
+                  const SizedBox(height: 10),
+                  _ControlToggleTile(
+                    icon: Icons.mic_none_rounded,
+                    iconColor: Colors.teal,
+                    title: 'Voice SOS',
+                    subtitle:
+                        'Listens for help me, save me, SOS, or emergency and triggers SOS automatically.',
+                    value: _sosController.isVoiceSOSActive.value,
+                    onChanged: _sosController.toggleVoiceSOS,
+                  ),
+                  const SizedBox(height: 10),
+                  _ControlToggleTile(
+                    icon: Icons.local_fire_department,
+                    iconColor: Colors.redAccent,
+                    title: 'Unsafe Zones',
+                    subtitle: 'Shows community-reported danger areas on map.',
+                    value: _heatmapController.isHeatmapVisible.value,
+                    onChanged: (_) => _heatmapController.toggleHeatmap(),
+                  ),
+                ],
+              ),
+            ),
+          ),
+        );
+      },
+    );
+  }
+
   @override
   Widget build(BuildContext context) {
+    final mediaQuery = MediaQuery.of(context);
+    final floatingOffsets = JourneySafetyService.getFloatingButtonOffsets(
+      isTripActive:
+          _isJourneyGuardEnabled &&
+          (_isJourneyActive || _journeyRouteLocations.isNotEmpty),
+      hasResponderCard: _selectedResponderUid != null,
+      screenHeight: mediaQuery.size.height,
+      safeBottomPadding:
+          max(mediaQuery.viewPadding.bottom, mediaQuery.padding.bottom) + 8,
+    );
     return Scaffold(
       appBar: AppBar(
         title: const Text(
@@ -564,42 +940,38 @@ class _MapScreenState extends State<MapScreen> {
           Obx(
             () => Row(
               children: [
-                const Tooltip(
-                  message: 'Shake to trigger SOS',
-                  child: Icon(Icons.vibration, size: 20),
-                ),
-                Switch(
-                  value: _sosController.isShakeSOSActive.value,
-                  onChanged: (val) => _sosController.toggleShakeSOS(val),
-                  activeThumbColor: Colors.deepPurpleAccent,
-                ),
-                const SizedBox(width: 8),
-                const Tooltip(
-                  message: 'Community Unsafe Zones',
-                  child: Icon(
-                    Icons.local_fire_department,
-                    size: 20,
-                    color: Colors.red,
+                Tooltip(
+                  message: 'Open Safety Controls',
+                  child: IconButton(
+                    onPressed: _showSafetyControlsSheet,
+                    icon: const Icon(Icons.tune_rounded),
+                    visualDensity: VisualDensity.compact,
                   ),
                 ),
-                Switch(
-                  value: _heatmapController.isHeatmapVisible.value,
-                  onChanged: (val) => _heatmapController.toggleHeatmap(),
-                  activeThumbColor: Colors.redAccent,
-                ),
-                const Tooltip(
-                  message: 'Show Safety Heatmap',
-                  child: Icon(
-                    Icons.whatshot,
-                    size: 20,
-                    color: Colors.orangeAccent,
+                Tooltip(
+                  message:
+                      'Automatically monitors your journey and can trigger SOS if high-risk deviation is detected.',
+                  child: Padding(
+                    padding: const EdgeInsets.only(right: 4),
+                    child: _TopBarStatusChip(
+                      label: _isJourneyActive
+                          ? 'Guard Active'
+                          : _isJourneyGuardEnabled
+                          ? 'Guard Ready'
+                          : 'Guard Off',
+                      icon: _isJourneyActive
+                          ? Icons.shield
+                          : Icons.shield_outlined,
+                      accentColor: _isJourneyActive
+                          ? Colors.greenAccent
+                          : _isJourneyGuardEnabled
+                          ? Colors.amber
+                          : Colors.white70,
+                      isEnabled: _isJourneyGuardEnabled,
+                      onTap: () =>
+                          _handleJourneyGuardToggle(!_isJourneyGuardEnabled),
+                    ),
                   ),
-                ),
-                Switch(
-                  value: _sosHeatmapController.isVisible.value,
-                  onChanged: (val) =>
-                      _sosHeatmapController.toggleVisibility(val),
-                  activeThumbColor: Colors.orangeAccent,
                 ),
                 PopupMenuButton<_AppMenuAction>(
                   icon: const Icon(Icons.more_vert),
@@ -716,7 +1088,8 @@ class _MapScreenState extends State<MapScreen> {
                             color: Colors.blueAccent,
                             strokeWidth: 5.0,
                           ),
-                        if (_journeyRouteLocations.isNotEmpty)
+                        if (_isJourneyGuardEnabled &&
+                            _journeyRouteLocations.isNotEmpty)
                           Polyline(
                             points: _journeyRouteLocations,
                             color: Colors.deepPurpleAccent,
@@ -787,7 +1160,8 @@ class _MapScreenState extends State<MapScreen> {
                               color: Colors.redAccent,
                             ),
                           ),
-                        if (_journeyDestination != null)
+                        if (_isJourneyGuardEnabled &&
+                            _journeyDestination != null)
                           Marker(
                             point: _journeyDestination!,
                             width: 80,
@@ -861,12 +1235,28 @@ class _MapScreenState extends State<MapScreen> {
                         return CircleLayer(
                           circles: _heatmapController.unsafeZones.map((zone) {
                             final isSelected = zone.id == _selectedUnsafeZoneId;
+                            
+                            Color baseColor;
+                            switch (zone.confidence) {
+                              case ZoneConfidence.high:
+                                baseColor = Colors.red;
+                                break;
+                              case ZoneConfidence.medium:
+                                baseColor = Colors.orange;
+                                break;
+                              case ZoneConfidence.low:
+                                baseColor = Colors.orangeAccent;
+                                break;
+                            }
+                            
+                            final fillColor = baseColor.withOpacity(
+                                isSelected ? 0.34 : (zone.confidence == ZoneConfidence.low ? 0.15 : 0.24)
+                            );
+                            
                             return CircleMarker(
                               point: zone.point,
-                              color: Colors.red.withOpacity(
-                                isSelected ? 0.34 : 0.24,
-                              ),
-                              borderColor: Colors.red,
+                              color: fillColor,
+                              borderColor: baseColor,
                               borderStrokeWidth: isSelected ? 2.2 : 1.2,
                               useRadiusInMeter: true,
                               radius: isSelected
@@ -911,7 +1301,6 @@ class _MapScreenState extends State<MapScreen> {
                     ? RescueInviteController.instance.shareActiveRescueInvite
                     : null,
                 joinedViaInvite: joinedViaInvite,
-                callStatusText: _sosCallController.callStatusText.value,
               ),
             );
           }),
@@ -946,65 +1335,137 @@ class _MapScreenState extends State<MapScreen> {
                 },
               ),
             ),
-          if (_currentPosition != null)
+          if (_currentPosition != null && _isJourneyGuardEnabled)
             Positioned(
               left: 16,
               right: 16,
-              bottom: _selectedResponderUid != null ? 180 : 16,
+              bottom: floatingOffsets.journeyPanelBottom,
               child: Card(
                 child: Padding(
                   padding: const EdgeInsets.symmetric(
                     horizontal: 12,
                     vertical: 10,
                   ),
-                  child: Row(
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    mainAxisSize: MainAxisSize.min,
                     children: [
-                      Expanded(
-                        child: Text(
-                          _isJourneyActive
-                              ? (_journeyDeviationMeters == null
-                                    ? 'Journey active'
-                                    : 'Deviation: ${_journeyDeviationMeters!.toStringAsFixed(0)}m')
-                              : _isSelectingJourneyDestination
-                              ? 'Tap map to pick destination'
-                              : 'Journey Guard',
-                          maxLines: 2,
-                          overflow: TextOverflow.ellipsis,
-                          style: const TextStyle(fontWeight: FontWeight.w600),
+                      Text(
+                        _isJourneyActive
+                            ? 'Journey active'
+                            : _isSelectingJourneyDestination
+                            ? 'Tap map to pick destination'
+                            : 'Journey Guard',
+                        maxLines: 1,
+                        overflow: TextOverflow.ellipsis,
+                        style: const TextStyle(
+                          fontWeight: FontWeight.w700,
+                          fontSize: 18,
                         ),
                       ),
-                      const SizedBox(width: 8),
-                      if (!_isJourneyActive)
-                        TextButton(
-                          onPressed: _enableJourneyDestinationSelection,
-                          child: const Text('Choose'),
+                      const SizedBox(height: 8),
+                      Text(
+                        _isJourneyActive
+                            ? 'Journey Guard Active'
+                            : 'Auto Trip Safety monitors deviation and nearby danger zones after you start the journey.',
+                        style: TextStyle(
+                          color: Theme.of(context).colorScheme.onSurfaceVariant,
+                          fontSize: 12,
+                          fontWeight: FontWeight.w500,
                         ),
-                      if (!_isJourneyActive &&
-                          _journeyRouteLocations.isNotEmpty)
-                        FilledButton(
-                          onPressed: _startJourney,
-                          child: const Text('Start'),
+                      ),
+                      const SizedBox(height: 8),
+                      Wrap(
+                        spacing: 10,
+                        runSpacing: 6,
+                        children: [
+                          if (_journeyRouteSummary != null)
+                            Text(
+                              'ETA ${_formatDuration(_journeyRouteSummary!.durationSeconds)}',
+                              style: TextStyle(
+                                color: Theme.of(
+                                  context,
+                                ).colorScheme.onSurfaceVariant,
+                                fontWeight: FontWeight.w500,
+                              ),
+                            ),
+                          if (_journeyRouteSummary != null)
+                            Text(
+                              'Distance ${_formatDistance(_journeyRouteSummary!.distanceMeters)}',
+                              style: TextStyle(
+                                color: Theme.of(
+                                  context,
+                                ).colorScheme.onSurfaceVariant,
+                                fontWeight: FontWeight.w500,
+                              ),
+                            ),
+                          if (_journeyDeviationMeters != null &&
+                              _isJourneyActive)
+                            Text(
+                              'Deviation ${_journeyDeviationMeters!.toStringAsFixed(0)}m',
+                              style: TextStyle(
+                                color: Theme.of(
+                                  context,
+                                ).colorScheme.onSurfaceVariant,
+                                fontWeight: FontWeight.w500,
+                              ),
+                            ),
+                        ],
+                      ),
+                      if (_journeyWarningMessage != null) ...[
+                        const SizedBox(height: 8),
+                        Text(
+                          _journeyWarningMessage!,
+                          style: const TextStyle(
+                            color: Colors.redAccent,
+                            fontWeight: FontWeight.w600,
+                            fontSize: 12,
+                          ),
                         ),
-                      if (_isJourneyActive)
-                        FilledButton(
-                          onPressed: _endJourney,
-                          child: const Text('End'),
-                        ),
+                      ],
+                      const SizedBox(height: 10),
+                      Row(
+                        children: [
+                          if (!_isJourneyActive)
+                            TextButton(
+                              onPressed: _enableJourneyDestinationSelection,
+                              child: const Text('Choose'),
+                            ),
+                          if (!_isJourneyActive &&
+                              _journeyRouteLocations.isNotEmpty)
+                            FilledButton(
+                              onPressed: _startJourney,
+                              child: const Text('Start'),
+                            ),
+                          if (_isJourneyActive)
+                            FilledButton(
+                              onPressed: _endJourney,
+                              child: const Text('End Trip'),
+                            ),
+                        ],
+                      ),
                     ],
                   ),
                 ),
               ),
             ),
 
-          Positioned(
-            bottom: 180,
-            right: 16,
-            child: Obx(() {
-              final score = _riskController.currentRiskScore.value;
-              if (score == null) return const SizedBox.shrink();
-              return _RiskLevelIndicator(score: score);
-            }),
-          ),
+          if (_isJourneyGuardEnabled)
+            Positioned(
+              bottom: floatingOffsets.riskBottom,
+              right: 16,
+              child: Obx(() {
+                final score =
+                    _journeyRiskResult?.score ??
+                    _riskController.currentRiskScore.value;
+                if (score == null) return const SizedBox.shrink();
+                return _RiskLevelIndicator(
+                  score: score,
+                  intersectsDangerZone:
+                      _journeyRiskResult?.intersectsDangerZone == true,
+                );
+              }),
+            ),
 
           if (_isLoading)
             Container(
@@ -1101,19 +1562,35 @@ class _MapScreenState extends State<MapScreen> {
                           ),
                         ),
                         Obx(() {
-                          final callStatus =
-                              _sosCallController.callStatusText.value;
-                          if (callStatus.isEmpty) {
+                          final messages = <String>[];
+                          if (_sosController.isEmergencyRecording.value ||
+                              _sosController
+                                  .recordingStatusMessage
+                                  .value
+                                  .isNotEmpty) {
+                            messages.add(
+                              _sosController.recordingStatusMessage.value,
+                            );
+                          }
+                          if (_sosController.isVoiceSOSActive.value &&
+                              _sosController
+                                  .voiceStatusMessage
+                                  .value
+                                  .isNotEmpty) {
+                            messages.add(
+                              _sosController.voiceStatusMessage.value,
+                            );
+                          }
+                          if (messages.isEmpty) {
                             return const SizedBox.shrink();
                           }
                           return Padding(
                             padding: const EdgeInsets.only(top: 10),
                             child: Text(
-                              callStatus,
+                              messages.join('\n'),
                               style: const TextStyle(
-                                color: Colors.lightBlueAccent,
-                                fontSize: 14,
-                                fontWeight: FontWeight.w600,
+                                color: Colors.white60,
+                                fontSize: 13,
                               ),
                               textAlign: TextAlign.center,
                             ),
@@ -1303,24 +1780,6 @@ class _MapScreenState extends State<MapScreen> {
                           ),
                           textAlign: TextAlign.center,
                         ),
-                        Obx(() {
-                          final callStatus =
-                              _sosCallController.callStatusText.value;
-                          if (callStatus.isEmpty) {
-                            return const SizedBox.shrink();
-                          }
-                          return Padding(
-                            padding: const EdgeInsets.only(top: 12),
-                            child: Text(
-                              callStatus,
-                              style: const TextStyle(
-                                color: Colors.lightBlueAccent,
-                                fontWeight: FontWeight.w600,
-                              ),
-                              textAlign: TextAlign.center,
-                            ),
-                          );
-                        }),
                         if (_sosController.isSendingEmergencyAlerts.value) ...[
                           const SizedBox(height: 12),
                           Text(
@@ -1352,63 +1811,277 @@ class _MapScreenState extends State<MapScreen> {
       floatingActionButton: Obx(
         () => (_sosController.isCountdown.value || _sosController.isSent.value)
             ? const SizedBox.shrink() // Hide buttons during overlays
-            : Column(
-                mainAxisAlignment: MainAxisAlignment.end,
-                mainAxisSize: MainAxisSize.min,
-                children: [
-                  if (_sosController.isActiveBroadcast.value)
-                    Obx(
-                      () => FloatingActionButton.extended(
-                        heroTag: 'stopSosBtn',
-                        onPressed: _sosController.isCompletingRescue.value
-                            ? null
-                            : () => _sosController.stopActiveSOS(),
-                        backgroundColor: Colors.black,
-                        foregroundColor: Colors.greenAccent,
-                        icon: _sosController.isCompletingRescue.value
-                            ? const SizedBox(
-                                width: 22,
-                                height: 22,
-                                child: CircularProgressIndicator(
-                                  strokeWidth: 2,
-                                  color: Colors.greenAccent,
-                                ),
-                              )
-                            : const Icon(Icons.verified_user, size: 28),
-                        label: Text(
-                          _sosController.isCompletingRescue.value
-                              ? "COMPLETING..."
-                              : "I'M SAFE",
-                          style: TextStyle(
-                            fontWeight: FontWeight.bold,
-                            fontSize: 18,
-                          ),
+            : SizedBox(
+                width: 170,
+                height:
+                    max(
+                      floatingOffsets.locationBottom,
+                      floatingOffsets.sosBottom,
+                    ) +
+                    100,
+                child: Stack(
+                  clipBehavior: Clip.none,
+                  children: [
+                    if (_currentPosition != null &&
+                        !_isLoading &&
+                        !_sosController.isLoading.value)
+                      Positioned(
+                        right: 0,
+                        bottom: floatingOffsets.locationBottom,
+                        child: FloatingActionButton(
+                          heroTag: 'locationBtn',
+                          onPressed: () {
+                            if (_currentPosition != null) {
+                              _moveCameraTo(_currentPosition!);
+                            }
+                          },
+                          backgroundColor: Theme.of(
+                            context,
+                          ).colorScheme.primary,
+                          foregroundColor: Theme.of(
+                            context,
+                          ).colorScheme.onPrimary,
+                          child: const Icon(Icons.my_location),
                         ),
                       ),
-                    )
-                  else
-                    _PulsingSosButton(
-                      onPressed: () => _sosController.initiateSOSWorkflow(),
+                    Positioned(
+                      right: 0,
+                      bottom: floatingOffsets.sosBottom,
+                      child: _sosController.isActiveBroadcast.value
+                          ? Obx(
+                              () => FloatingActionButton.extended(
+                                heroTag: 'stopSosBtn',
+                                onPressed:
+                                    _sosController.isCompletingRescue.value
+                                    ? null
+                                    : () => _sosController.stopActiveSOS(),
+                                backgroundColor: Colors.black,
+                                foregroundColor: Colors.greenAccent,
+                                icon: _sosController.isCompletingRescue.value
+                                    ? const SizedBox(
+                                        width: 22,
+                                        height: 22,
+                                        child: CircularProgressIndicator(
+                                          strokeWidth: 2,
+                                          color: Colors.greenAccent,
+                                        ),
+                                      )
+                                    : const Icon(Icons.verified_user, size: 28),
+                                label: Text(
+                                  _sosController.isCompletingRescue.value
+                                      ? "COMPLETING..."
+                                      : "I'M SAFE",
+                                  style: TextStyle(
+                                    fontWeight: FontWeight.bold,
+                                    fontSize: 18,
+                                  ),
+                                ),
+                              ),
+                            )
+                          : _PulsingSosButton(
+                              onPressed: () =>
+                                  _sosController.initiateSOSWorkflow(),
+                            ),
                     ),
-                  const SizedBox(height: 16),
-                  if (_currentPosition != null &&
-                      !_isLoading &&
-                      !_sosController.isLoading.value)
-                    FloatingActionButton(
-                      heroTag: 'locationBtn',
-                      onPressed: () {
-                        if (_currentPosition != null) {
-                          _moveCameraTo(_currentPosition!);
-                        }
-                      },
-                      backgroundColor: Theme.of(context).colorScheme.primary,
-                      foregroundColor: Theme.of(context).colorScheme.onPrimary,
-                      child: const Icon(Icons.my_location),
-                    ),
-                ],
+                  ],
+                ),
               ),
       ),
     );
+  }
+
+  Future<_JourneyRouteBuildResult> _buildSafeJourneyRoute(
+    LatLng start,
+    LatLng destination,
+  ) async {
+    final visibleUnsafeZones = _heatmapController.unsafeZones;
+    final candidateRoutes = <JourneySafetyCandidate>[];
+    final uniqueCandidateKeys = <String>{};
+    final baseRoutes = await RoutingService.getAlternativeRoutes(
+      start,
+      destination,
+      maxAlternatives: 3,
+    );
+    final baseRoute = baseRoutes.isNotEmpty
+        ? baseRoutes.first
+        : await RoutingService.getRoute(start, destination);
+    if (baseRoute.points.isEmpty) {
+      return const _JourneyRouteBuildResult(
+        route: RouteSummary(points: [], distanceMeters: 0, durationSeconds: 0),
+      );
+    }
+
+    _addJourneyCandidates(
+      candidateRoutes: candidateRoutes,
+      uniqueCandidateKeys: uniqueCandidateKeys,
+      routes: baseRoutes.isNotEmpty ? baseRoutes : [baseRoute],
+      visibleUnsafeZones: visibleUnsafeZones,
+      userLocation: start,
+      viaPoints: const [],
+    );
+
+    if (visibleUnsafeZones.isNotEmpty) {
+      for (final zone in visibleUnsafeZones) {
+        final baseZoneDistance = _distanceToPolylineMeters(
+          zone.point,
+          baseRoute.points,
+        );
+        final zoneInfluenceDistance =
+            _unsafeZoneRadiusMeters +
+            JourneySafetyService.getAdaptiveDangerBufferForZone(zone) +
+            120;
+        if (baseZoneDistance > zoneInfluenceDistance) {
+          continue;
+        }
+
+        final detours = _buildDetourWaypointsForZone(baseRoute.points, zone);
+        for (final waypoint in detours) {
+          final reroutedRoutes = await RoutingService.getAlternativeRoutes(
+            start,
+            destination,
+            viaPoints: [waypoint],
+            maxAlternatives: 2,
+          );
+          if (reroutedRoutes.isEmpty) {
+            continue;
+          }
+
+          _addJourneyCandidates(
+            candidateRoutes: candidateRoutes,
+            uniqueCandidateKeys: uniqueCandidateKeys,
+            routes: reroutedRoutes,
+            visibleUnsafeZones: visibleUnsafeZones,
+            userLocation: start,
+            viaPoints: [waypoint],
+          );
+        }
+      }
+    }
+
+    final decision = JourneySafetyService.selectBalancedSafeRoute(
+      candidateRoutes,
+      visibleUnsafeZones,
+      actualZoneRadiusMeters: _unsafeZoneRadiusMeters,
+      maxDetourRatio: 1.32,
+    );
+    if (decision == null) {
+      return _JourneyRouteBuildResult(route: baseRoute);
+    }
+
+    return _JourneyRouteBuildResult(
+      route: decision.candidate.route,
+      warningMessage: decision.warningMessage,
+    );
+  }
+
+  List<LatLng> _buildDetourWaypointsForZone(
+    List<LatLng> routePoints,
+    UnsafeZone zone,
+  ) {
+    if (routePoints.length < 2) {
+      return const <LatLng>[];
+    }
+
+    final zoneCenter = zone.point;
+    var bestStart = routePoints.first;
+    var bestEnd = routePoints[1];
+    var nearestDistance = double.infinity;
+
+    for (var i = 0; i < routePoints.length - 1; i++) {
+      final distance = JourneySafetyService.distanceToSegmentMeters(
+        zoneCenter,
+        routePoints[i],
+        routePoints[i + 1],
+      );
+      if (distance < nearestDistance) {
+        nearestDistance = distance;
+        bestStart = routePoints[i];
+        bestEnd = routePoints[i + 1];
+      }
+    }
+
+    final dx = bestEnd.longitude - bestStart.longitude;
+    final dy = bestEnd.latitude - bestStart.latitude;
+    final length = sqrt(dx * dx + dy * dy);
+    if (length == 0) {
+      return const <LatLng>[];
+    }
+
+    final perpendicularX = -dy / length;
+    final perpendicularY = dx / length;
+    final baseOffsetMeters =
+        _unsafeZoneRadiusMeters +
+        JourneySafetyService.getAdaptiveDangerBufferForZone(zone);
+    final waypointOptions = <LatLng>[];
+
+    for (final scale in [1.0, 0.8, 0.65]) {
+      final offsetMeters = baseOffsetMeters * scale;
+      final latOffset = (perpendicularY * offsetMeters) / 111320.0;
+      final lngOffset =
+          (perpendicularX * offsetMeters) /
+          (111320.0 *
+              cos(zoneCenter.latitude * pi / 180).clamp(0.2, double.infinity));
+      waypointOptions.add(
+        LatLng(
+          zoneCenter.latitude + latOffset,
+          zoneCenter.longitude + lngOffset,
+        ),
+      );
+      waypointOptions.add(
+        LatLng(
+          zoneCenter.latitude - latOffset,
+          zoneCenter.longitude - lngOffset,
+        ),
+      );
+    }
+
+    return waypointOptions;
+  }
+
+  void _addJourneyCandidates({
+    required List<JourneySafetyCandidate> candidateRoutes,
+    required Set<String> uniqueCandidateKeys,
+    required List<RouteSummary> routes,
+    required List<UnsafeZone> visibleUnsafeZones,
+    required LatLng userLocation,
+    required List<LatLng> viaPoints,
+  }) {
+    for (final route in routes) {
+      if (route.points.isEmpty) {
+        continue;
+      }
+
+      final routeKey = [
+        route.distanceMeters.toStringAsFixed(0),
+        route.durationSeconds.toStringAsFixed(0),
+        route.points.length,
+        if (route.points.isNotEmpty)
+          '${route.points.first.latitude.toStringAsFixed(4)},${route.points.first.longitude.toStringAsFixed(4)}',
+        if (route.points.length > 2)
+          '${route.points[route.points.length ~/ 2].latitude.toStringAsFixed(4)},${route.points[route.points.length ~/ 2].longitude.toStringAsFixed(4)}',
+        if (route.points.isNotEmpty)
+          '${route.points.last.latitude.toStringAsFixed(4)},${route.points.last.longitude.toStringAsFixed(4)}',
+      ].join('|');
+
+      if (!uniqueCandidateKeys.add(routeKey)) {
+        continue;
+      }
+
+      candidateRoutes.add(
+        JourneySafetyCandidate(
+          route: route,
+          viaPoints: viaPoints,
+          risk: JourneySafetyService.calculateRouteRisk(
+            route.points,
+            visibleUnsafeZones,
+            userLocation: userLocation,
+            dangerBufferMeters:
+                _unsafeZoneRadiusMeters + _unsafeRouteBufferMeters,
+            actualZoneRadiusMeters: _unsafeZoneRadiusMeters,
+          ),
+        ),
+      );
+    }
   }
 
   String _formatDistance(double distanceMeters) {
@@ -1636,10 +2309,11 @@ class _MapScreenState extends State<MapScreen> {
   }
 
   void _handleMapTap(TapPosition tapPosition, LatLng point) {
-    if (_isSelectingJourneyDestination) {
+    if (_isJourneyGuardEnabled && _isSelectingJourneyDestination) {
       setState(() {
         _isSelectingJourneyDestination = false;
       });
+      unawaited(_persistJourneyGuardState());
       _setJourneyDestination(point);
       return;
     }
@@ -1703,7 +2377,7 @@ class _MapScreenState extends State<MapScreen> {
       if (points.length < 2) continue;
 
       for (var i = 0; i < points.length - 1; i++) {
-        final distance = _distanceToSegmentMeters(
+        final distance = JourneySafetyService.distanceToSegmentMeters(
           tapPoint,
           points[i],
           points[i + 1],
@@ -1719,38 +2393,6 @@ class _MapScreenState extends State<MapScreen> {
       return nearestUid;
     }
     return null;
-  }
-
-  double _distanceToSegmentMeters(LatLng point, LatLng start, LatLng end) {
-    final avgLat =
-        ((start.latitude + end.latitude + point.latitude) / 3) *
-        3.141592653589793 /
-        180;
-    final metersPerLat = 111320.0;
-    final metersPerLng = 111320.0 * cos(avgLat);
-
-    final px = point.longitude * metersPerLng;
-    final py = point.latitude * metersPerLat;
-    final x1 = start.longitude * metersPerLng;
-    final y1 = start.latitude * metersPerLat;
-    final x2 = end.longitude * metersPerLng;
-    final y2 = end.latitude * metersPerLat;
-
-    final dx = x2 - x1;
-    final dy = y2 - y1;
-    if (dx == 0 && dy == 0) {
-      final deltaX = px - x1;
-      final deltaY = py - y1;
-      return sqrt(deltaX * deltaX + deltaY * deltaY);
-    }
-
-    final t = (((px - x1) * dx) + ((py - y1) * dy)) / ((dx * dx) + (dy * dy));
-    final clampedT = t.clamp(0.0, 1.0);
-    final projectionX = x1 + (dx * clampedT);
-    final projectionY = y1 + (dy * clampedT);
-    final deltaX = px - projectionX;
-    final deltaY = py - projectionY;
-    return sqrt(deltaX * deltaX + deltaY * deltaY);
   }
 
   void _showUnsafeZoneDetails(UnsafeZone zone) {
@@ -1996,125 +2638,6 @@ class _MapScreenState extends State<MapScreen> {
       ),
     );
   }
-
-  Future<void> _showPostSafeActionsSheet() async {
-    if (!mounted) return;
-
-    _isPostSafeSheetVisible = true;
-    await Get.bottomSheet<void>(
-      SafeArea(
-        child: Container(
-          padding: const EdgeInsets.fromLTRB(20, 18, 20, 24),
-          decoration: BoxDecoration(
-            color: Theme.of(context).colorScheme.surface,
-            borderRadius: const BorderRadius.vertical(top: Radius.circular(28)),
-          ),
-          child: Column(
-            mainAxisSize: MainAxisSize.min,
-            crossAxisAlignment: CrossAxisAlignment.start,
-            children: [
-              Center(
-                child: Container(
-                  width: 46,
-                  height: 5,
-                  decoration: BoxDecoration(
-                    color: Colors.grey.shade400,
-                    borderRadius: BorderRadius.circular(999),
-                  ),
-                ),
-              ),
-              const SizedBox(height: 18),
-              const Text(
-                'Rescue marked safe',
-                style: TextStyle(fontSize: 20, fontWeight: FontWeight.w700),
-              ),
-              const SizedBox(height: 8),
-              Obx(
-                () => Text(
-                  _sosCallController.callStatusText.value.isEmpty
-                      ? 'You can keep the emergency call active, end it now, or notify contacts that you are safe.'
-                      : _sosCallController.callStatusText.value,
-                  style: TextStyle(
-                    color: Colors.grey.shade700,
-                    fontSize: 14,
-                    height: 1.35,
-                  ),
-                ),
-              ),
-              const SizedBox(height: 18),
-              SizedBox(
-                width: double.infinity,
-                child: FilledButton.icon(
-                  onPressed: () {
-                    _sosCallController.dismissPostSafeActions();
-                    Get.back<void>();
-                  },
-                  icon: const Icon(Icons.call),
-                  label: const Text('Continue Call'),
-                ),
-              ),
-              const SizedBox(height: 10),
-              SizedBox(
-                width: double.infinity,
-                child: Obx(
-                  () => OutlinedButton.icon(
-                    onPressed: _sosCallController.isEndingCall.value
-                        ? null
-                        : () async {
-                            await _sosCallController.endActiveCallAfterSafe();
-                            if (Get.isBottomSheetOpen == true) {
-                              Get.back<void>();
-                            }
-                          },
-                    icon: _sosCallController.isEndingCall.value
-                        ? const SizedBox(
-                            width: 18,
-                            height: 18,
-                            child: CircularProgressIndicator(strokeWidth: 2),
-                          )
-                        : const Icon(Icons.call_end),
-                    label: Text(
-                      _sosCallController.isEndingCall.value
-                          ? 'Ending Call...'
-                          : 'End Call',
-                    ),
-                    style: OutlinedButton.styleFrom(
-                      foregroundColor: Colors.redAccent,
-                      side: const BorderSide(color: Colors.redAccent),
-                    ),
-                  ),
-                ),
-              ),
-              const SizedBox(height: 10),
-              SizedBox(
-                width: double.infinity,
-                child: TextButton.icon(
-                  onPressed: () async {
-                    await _sosCallController.notifyContactsSafe();
-                    if (mounted) {
-                      ScaffoldMessenger.of(context).showSnackBar(
-                        const SnackBar(
-                          content: Text('Safe status shared with contacts'),
-                          behavior: SnackBarBehavior.floating,
-                        ),
-                      );
-                    }
-                  },
-                  icon: const Icon(Icons.verified_user_outlined),
-                  label: const Text("Notify contacts I'm safe"),
-                ),
-              ),
-            ],
-          ),
-        ),
-      ),
-      isDismissible: false,
-      enableDrag: false,
-    ).whenComplete(() {
-      _isPostSafeSheetVisible = false;
-      _sosCallController.dismissPostSafeActions();
-    });
-  }
 }
 
 // Dedicated Widget handling local repetitive animation states cleanly
@@ -2177,7 +2700,6 @@ class _RouteSummaryCard extends StatelessWidget {
     required this.onLeaveRescue,
     required this.onShareInvite,
     required this.joinedViaInvite,
-    required this.callStatusText,
   });
 
   final String distanceLabel;
@@ -2186,7 +2708,6 @@ class _RouteSummaryCard extends StatelessWidget {
   final VoidCallback onLeaveRescue;
   final Future<void> Function()? onShareInvite;
   final bool joinedViaInvite;
-  final String callStatusText;
 
   @override
   Widget build(BuildContext context) {
@@ -2273,39 +2794,6 @@ class _RouteSummaryCard extends StatelessWidget {
                 height: 1.25,
               ),
             ),
-            if (callStatusText.trim().isNotEmpty) ...[
-              const SizedBox(height: 10),
-              Container(
-                padding: const EdgeInsets.symmetric(
-                  horizontal: 12,
-                  vertical: 8,
-                ),
-                decoration: BoxDecoration(
-                  color: Colors.white.withOpacity(0.14),
-                  borderRadius: BorderRadius.circular(14),
-                ),
-                child: Row(
-                  children: [
-                    const Icon(
-                      Icons.call_rounded,
-                      color: Colors.white,
-                      size: 16,
-                    ),
-                    const SizedBox(width: 8),
-                    Expanded(
-                      child: Text(
-                        callStatusText,
-                        style: const TextStyle(
-                          color: Colors.white,
-                          fontSize: 12,
-                          fontWeight: FontWeight.w600,
-                        ),
-                      ),
-                    ),
-                  ],
-                ),
-              ),
-            ],
             if (joinedViaInvite) ...[
               const SizedBox(height: 12),
               Container(
@@ -2402,6 +2890,129 @@ class _RouteMetricChip extends StatelessWidget {
               fontWeight: FontWeight.w600,
             ),
           ),
+        ],
+      ),
+    );
+  }
+}
+
+class _TopBarStatusChip extends StatelessWidget {
+  const _TopBarStatusChip({
+    required this.label,
+    required this.icon,
+    required this.accentColor,
+    required this.isEnabled,
+    required this.onTap,
+  });
+
+  final String label;
+  final IconData icon;
+  final Color accentColor;
+  final bool isEnabled;
+  final VoidCallback onTap;
+
+  @override
+  Widget build(BuildContext context) {
+    return Material(
+      color: Colors.transparent,
+      child: InkWell(
+        borderRadius: BorderRadius.circular(999),
+        onTap: onTap,
+        child: Ink(
+          padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 8),
+          decoration: BoxDecoration(
+            color: Colors.black.withOpacity(isEnabled ? 0.18 : 0.1),
+            borderRadius: BorderRadius.circular(999),
+            border: Border.all(
+              color: accentColor.withOpacity(isEnabled ? 0.55 : 0.3),
+            ),
+          ),
+          child: Row(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              Icon(icon, size: 16, color: accentColor),
+              const SizedBox(width: 6),
+              Text(
+                label,
+                style: TextStyle(
+                  color: Theme.of(context).colorScheme.onPrimaryContainer,
+                  fontSize: 11,
+                  fontWeight: FontWeight.w700,
+                ),
+              ),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+}
+
+class _ControlToggleTile extends StatelessWidget {
+  const _ControlToggleTile({
+    required this.icon,
+    required this.iconColor,
+    required this.title,
+    required this.subtitle,
+    required this.value,
+    required this.onChanged,
+  });
+
+  final IconData icon;
+  final Color iconColor;
+  final String title;
+  final String subtitle;
+  final bool value;
+  final ValueChanged<bool> onChanged;
+
+  @override
+  Widget build(BuildContext context) {
+    return Container(
+      padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 12),
+      decoration: BoxDecoration(
+        color: Theme.of(
+          context,
+        ).colorScheme.surfaceContainerHighest.withOpacity(0.4),
+        borderRadius: BorderRadius.circular(18),
+      ),
+      child: Row(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Container(
+            margin: const EdgeInsets.only(top: 2),
+            padding: const EdgeInsets.all(10),
+            decoration: BoxDecoration(
+              color: iconColor.withOpacity(0.12),
+              borderRadius: BorderRadius.circular(14),
+            ),
+            child: Icon(icon, color: iconColor, size: 20),
+          ),
+          const SizedBox(width: 12),
+          Expanded(
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Text(
+                  title,
+                  style: const TextStyle(
+                    fontWeight: FontWeight.w700,
+                    fontSize: 15,
+                  ),
+                ),
+                const SizedBox(height: 4),
+                Text(
+                  subtitle,
+                  style: TextStyle(
+                    color: Theme.of(context).colorScheme.onSurfaceVariant,
+                    fontSize: 12,
+                    height: 1.35,
+                  ),
+                ),
+              ],
+            ),
+          ),
+          const SizedBox(width: 8),
+          Switch.adaptive(value: value, onChanged: onChanged),
         ],
       ),
     );
@@ -2536,6 +3147,13 @@ class _CachedResponderRoute {
   final _ResponderRouteData data;
 }
 
+class _JourneyRouteBuildResult {
+  const _JourneyRouteBuildResult({required this.route, this.warningMessage});
+
+  final RouteSummary route;
+  final String? warningMessage;
+}
+
 class _ResponderRouteCard extends StatelessWidget {
   const _ResponderRouteCard({
     required this.route,
@@ -2653,7 +3271,12 @@ enum _AppMenuAction {
 
 class _RiskLevelIndicator extends StatelessWidget {
   final double score;
-  const _RiskLevelIndicator({required this.score});
+  final bool intersectsDangerZone;
+
+  const _RiskLevelIndicator({
+    required this.score,
+    this.intersectsDangerZone = false,
+  });
 
   @override
   Widget build(BuildContext context) {
@@ -2665,6 +3288,12 @@ class _RiskLevelIndicator extends StatelessWidget {
     } else {
       riskColor = Colors.redAccent;
     }
+
+    final label = score <= 30
+        ? 'Low'
+        : score <= 60
+        ? 'Moderate'
+        : 'High';
 
     return Container(
       padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 10),
@@ -2712,7 +3341,21 @@ class _RiskLevelIndicator extends StatelessWidget {
               ),
             ],
           ),
-          if (score > 60)
+          Padding(
+            padding: const EdgeInsets.only(top: 4),
+            child: Text(
+              intersectsDangerZone
+                  ? '$label • Route intersects unsafe area'
+                  : label,
+              style: TextStyle(
+                color: riskColor,
+                fontWeight: FontWeight.bold,
+                fontSize: 12,
+                letterSpacing: 0.4,
+              ),
+            ),
+          ),
+          if (score > 60 && !intersectsDangerZone)
             const Padding(
               padding: EdgeInsets.only(top: 4),
               child: Text(

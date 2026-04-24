@@ -3,6 +3,9 @@ import 'package:get/get.dart';
 import 'package:latlong2/latlong.dart';
 import 'package:cloud_firestore/cloud_firestore.dart';
 import 'history_controller.dart';
+import 'auth_controller.dart';
+
+enum ZoneConfidence { high, medium, low }
 
 class UnsafeZone {
   const UnsafeZone({
@@ -12,6 +15,10 @@ class UnsafeZone {
     required this.timeStart,
     required this.timeEnd,
     this.areaName,
+    this.confidence = ZoneConfidence.low,
+    this.userCount = 1,
+    this.userId,
+    this.createdAt,
   });
 
   final String id;
@@ -20,6 +27,10 @@ class UnsafeZone {
   final String timeStart;
   final String timeEnd;
   final String? areaName;
+  final ZoneConfidence confidence;
+  final int userCount;
+  final String? userId;
+  final DateTime? createdAt;
 }
 
 class HeatmapController extends GetxController {
@@ -43,15 +54,27 @@ class HeatmapController extends GetxController {
         .snapshots()
         .listen(
         (QuerySnapshot snapshot) {
-          final List<UnsafeZone> fetchedZones = [];
+          final List<UnsafeZone> rawZones = [];
+          final now = DateTime.now();
+
           for (var doc in snapshot.docs) {
             final data = doc.data() as Map<String, dynamic>;
+            
+            // Time-based Filtering: Ignore reports older than 3 days
+            DateTime? createdAt;
+            if (data['timestamp'] != null) {
+               createdAt = (data['timestamp'] as Timestamp).toDate();
+               if (now.difference(createdAt).inDays > 3) {
+                 continue;
+               }
+            }
+            
             final timeStart = _readString(data['time_start']);
             final timeEnd = _readString(data['time_end']);
             if (data['lat'] != null &&
                 data['lng'] != null &&
                 _hasValidTimeRange(timeStart, timeEnd)) {
-              fetchedZones.add(
+              rawZones.add(
                 UnsafeZone(
                   id: doc.id,
                   point: LatLng(
@@ -62,18 +85,102 @@ class HeatmapController extends GetxController {
                   timeStart: timeStart!,
                   timeEnd: timeEnd!,
                   areaName: _readString(data['area_name']) ?? _readString(data['name']),
+                  userId: _readString(data['userId']),
+                  createdAt: createdAt,
                 ),
               );
             }
           }
+
+          // Zone Aggregation (Clustering)
+          final List<UnsafeZone> clusteredZones = _clusterZones(rawZones);
+
           // Reactive assignment forcing GetX Obx instances to reload map vectors securely
-          unsafeZones.assignAll(fetchedZones);
+          unsafeZones.assignAll(clusteredZones);
         },
         onError: (error) => debugPrint("Firestore Live Mapping Error: $error"),
       );
     } catch (e) {
       debugPrint("Firebase stream failed to bind completely: $e");
     }
+  }
+
+  List<UnsafeZone> _clusterZones(List<UnsafeZone> rawZones) {
+    if (rawZones.isEmpty) return [];
+
+    final List<List<UnsafeZone>> clusters = [];
+    const Distance distance = Distance();
+
+    for (final zone in rawZones) {
+      bool addedToCluster = false;
+      for (final cluster in clusters) {
+        double sumLat = 0;
+        double sumLng = 0;
+        for (var z in cluster) {
+          sumLat += z.point.latitude;
+          sumLng += z.point.longitude;
+        }
+        final center = LatLng(sumLat / cluster.length, sumLng / cluster.length);
+        
+        // 500m threshold for grouping
+        if (distance.as(LengthUnit.Meter, center, zone.point) <= 500) {
+          cluster.add(zone);
+          addedToCluster = true;
+          break;
+        }
+      }
+      if (!addedToCluster) {
+        clusters.add([zone]);
+      }
+    }
+
+    final List<UnsafeZone> result = [];
+    for (var i = 0; i < clusters.length; i++) {
+      final cluster = clusters[i];
+      double sumLat = 0;
+      double sumLng = 0;
+      final Set<String> uniqueUsers = {};
+      
+      // Take the reason from the most recent report (assuming the last one might not always be the newest, but let's take the first non-null)
+      String? combinedReason;
+      for (var z in cluster) {
+        sumLat += z.point.latitude;
+        sumLng += z.point.longitude;
+        if (z.userId != null) {
+          uniqueUsers.add(z.userId!);
+        }
+        if (combinedReason == null && z.reason != null) {
+          combinedReason = z.reason;
+        }
+      }
+      
+      final center = LatLng(sumLat / cluster.length, sumLng / cluster.length);
+      // Fallback: If no users have a userId stored, treat each point as unique for legacy data testing
+      final uniqueUserCount = uniqueUsers.isNotEmpty ? uniqueUsers.length : cluster.length;
+      
+      ZoneConfidence confidence;
+      if (uniqueUserCount >= 3) {
+        confidence = ZoneConfidence.high;
+      } else if (uniqueUserCount == 2) {
+        confidence = ZoneConfidence.medium;
+      } else {
+        confidence = ZoneConfidence.low;
+      }
+
+      result.add(
+        UnsafeZone(
+          id: 'cluster_$i', // Generate a pseudo-ID for the cluster
+          point: center,
+          reason: combinedReason ?? 'Multiple reasons',
+          timeStart: cluster.first.timeStart,
+          timeEnd: cluster.first.timeEnd,
+          confidence: confidence,
+          userCount: uniqueUserCount,
+        )
+      );
+    }
+
+    return result;
   }
 
   String? _readString(dynamic value) {
@@ -104,6 +211,35 @@ class HeatmapController extends GetxController {
     String? timeEnd,
   }) async {
     try {
+      String? userId;
+      if (Get.isRegistered<AuthController>()) {
+        userId = AuthController.instance.auth.currentUser?.uid;
+      }
+      
+      // User Rate Limiting: Check previous reports by this user today
+      if (userId != null) {
+        final now = DateTime.now();
+        final yesterday = now.subtract(const Duration(days: 1));
+        final recentReports = await FirebaseFirestore.instance
+            .collection('unsafe_zones')
+            .where('userId', isEqualTo: userId)
+            .where('timestamp', isGreaterThan: yesterday)
+            .get();
+            
+        if (recentReports.docs.length >= 3) {
+          Get.snackbar(
+            "Limit Reached", 
+            "You have reached the maximum number of reports (3) for today. Thank you for keeping the community safe!",
+            snackPosition: SnackPosition.BOTTOM,
+            backgroundColor: Colors.orange.withOpacity(0.9),
+            colorText: Colors.white,
+            duration: const Duration(seconds: 4),
+            icon: const Icon(Icons.info, color: Colors.white)
+          );
+          return;
+        }
+      }
+
       await FirebaseFirestore.instance.collection('unsafe_zones').add({
         'lat': point.latitude,
         'lng': point.longitude,
@@ -111,6 +247,7 @@ class HeatmapController extends GetxController {
         'time_start': timeStart,
         'time_end': timeEnd,
         'name': null,
+        'userId': userId,
         'timestamp': FieldValue.serverTimestamp(),
       });
 

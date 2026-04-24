@@ -53,6 +53,7 @@ dependencies:
   flutter_background_service: ^5.1.0
   flutter_local_notifications: ^21.0.0
   flutter_sms: ^3.0.1
+  speech_to_text: ^7.3.0
 
 dev_dependencies:
   flutter_test:

@@ -1,5 +1,6 @@
 import 'dart:async';
 import 'dart:math';
+import 'package:permission_handler/permission_handler.dart';
 import 'package:flutter/material.dart';
 import 'package:cloud_firestore/cloud_firestore.dart';
 import 'package:firebase_auth/firebase_auth.dart';
@@ -17,6 +18,8 @@ import '../controllers/sos_call_controller.dart';
 import '../services/routing_service.dart';
 import '../controllers/sos_listener_controller.dart';
 import '../screens/safe_route_menu_screens.dart';
+import '../controllers/risk_controller.dart';
+import '../controllers/sos_heatmap_controller.dart';
 
 class MapScreen extends StatefulWidget {
   const MapScreen({super.key});
@@ -30,10 +33,16 @@ class _MapScreenState extends State<MapScreen> {
   static const double _responderRouteCacheDistanceMeters = 25;
   static const double _routeTapThresholdMeters = 40;
   static const double _publishDistanceThresholdMeters = 10;
+  static const double _journeyDeviationThresholdMeters = 50;
+  static const double _journeyArrivalThresholdMeters = 30;
   final MapController _mapController = MapController();
   final SosController _sosController = Get.put(SosController());
   final HeatmapController _heatmapController = Get.put(HeatmapController());
   final SosCallController _sosCallController = Get.find<SosCallController>();
+  final SosHeatmapController _sosHeatmapController = Get.put(
+    SosHeatmapController(),
+  );
+  late final RiskController _riskController = RiskController.instance;
 
   Position? _currentPosition;
   String? _errorMessage;
@@ -57,10 +66,17 @@ class _MapScreenState extends State<MapScreen> {
   LatLng? _lastPublishedVictimLocation;
   LatLng? _lastPublishedResponderLocation;
   bool _isPostSafeSheetVisible = false;
+  bool _isSelectingJourneyDestination = false;
+  bool _isJourneyActive = false;
+  bool _hasAutoSosTriggered = false;
+  LatLng? _journeyDestination;
+  List<LatLng> _journeyRouteLocations = [];
+  double? _journeyDeviationMeters;
 
   @override
   void initState() {
     super.initState();
+    Permission.microphone.request();
     _fetchCurrentLocation();
     _startLocationTracking(); // Real-time continuous stream
     _bindActiveSessionTracking();
@@ -118,6 +134,7 @@ class _MapScreenState extends State<MapScreen> {
             });
 
             final currentLatLng = LatLng(position.latitude, position.longitude);
+            _evaluateJourneyProgress(currentLatLng);
 
             if (_sosController.isActiveBroadcast.value &&
                 _shouldPublishLocation(
@@ -194,6 +211,8 @@ class _MapScreenState extends State<MapScreen> {
         _currentPosition = position;
         _isLoading = false;
       });
+
+      _riskController.startPolling(position);
 
       if (!isFirstLoad) {
         _moveCameraTo(position);
@@ -366,6 +385,170 @@ class _MapScreenState extends State<MapScreen> {
     );
   }
 
+  void _enableJourneyDestinationSelection() {
+    setState(() {
+      _isSelectingJourneyDestination = true;
+    });
+    _showInfoSnackBar('Tap on map to choose destination');
+  }
+
+  Future<void> _setJourneyDestination(LatLng destination) async {
+    if (_currentPosition == null) {
+      _showErrorSnackBar('Current location unavailable.');
+      return;
+    }
+
+    try {
+      final route = await RoutingService.getRoute(
+        LatLng(_currentPosition!.latitude, _currentPosition!.longitude),
+        destination,
+      );
+      if (!mounted) return;
+      if (route.points.isEmpty) {
+        _showErrorSnackBar('Unable to build route for selected destination.');
+        return;
+      }
+
+      setState(() {
+        _journeyDestination = destination;
+        _journeyRouteLocations = route.points;
+        _journeyDeviationMeters = null;
+        _isJourneyActive = false;
+        _hasAutoSosTriggered = false;
+      });
+      unawaited(
+        HistoryController.instanceOrCreate().recordJourneyEvent(
+          title: 'Journey Route Ready',
+          subtitle:
+              'Distance ${_formatDistance(route.distanceMeters)} - ${_formatDuration(route.durationSeconds)}',
+          metadata: {
+            'destinationLat': destination.latitude,
+            'destinationLng': destination.longitude,
+          },
+        ),
+      );
+    } catch (_) {
+      _showErrorSnackBar('Failed to fetch shortest route.');
+    }
+  }
+
+  void _startJourney() {
+    if (_journeyRouteLocations.length < 2) {
+      _showErrorSnackBar('Select a destination and route first.');
+      return;
+    }
+    setState(() {
+      _isJourneyActive = true;
+      _hasAutoSosTriggered = false;
+    });
+    unawaited(
+      HistoryController.instanceOrCreate().recordJourneyEvent(
+        title: 'Journey Started',
+        subtitle: 'Live route monitoring enabled',
+      ),
+    );
+    _showInfoSnackBar(
+      'Journey started. SOS auto-triggers if you go off-route.',
+    );
+  }
+
+  void _endJourney({bool showMessage = true}) {
+    final wasActive = _isJourneyActive;
+    setState(() {
+      _isJourneyActive = false;
+      _isSelectingJourneyDestination = false;
+      _hasAutoSosTriggered = false;
+      _journeyDestination = null;
+      _journeyRouteLocations.clear();
+      _journeyDeviationMeters = null;
+    });
+    if (wasActive) {
+      unawaited(
+        HistoryController.instanceOrCreate().recordJourneyEvent(
+          title: 'Journey Ended',
+          subtitle: 'Route monitoring stopped',
+        ),
+      );
+    }
+    if (showMessage) {
+      _showInfoSnackBar('Journey ended.');
+    }
+  }
+
+  void _evaluateJourneyProgress(LatLng current) {
+    if (!_isJourneyActive || _journeyRouteLocations.length < 2) {
+      return;
+    }
+
+    final deviation = _distanceToPolylineMeters(
+      current,
+      _journeyRouteLocations,
+    );
+    if (mounted) {
+      setState(() {
+        _journeyDeviationMeters = deviation;
+      });
+    }
+
+    final destination = _journeyDestination;
+    if (destination != null) {
+      final distanceToDestination = Geolocator.distanceBetween(
+        current.latitude,
+        current.longitude,
+        destination.latitude,
+        destination.longitude,
+      );
+      if (distanceToDestination <= _journeyArrivalThresholdMeters) {
+        _endJourney(showMessage: true);
+        _showInfoSnackBar('Destination reached safely.');
+        return;
+      }
+    }
+
+    if (deviation > _journeyDeviationThresholdMeters && !_hasAutoSosTriggered) {
+      _hasAutoSosTriggered = true;
+      _endJourney(showMessage: false);
+      unawaited(() async {
+        final didTrigger = await _sosController.triggerAutoRouteDeviationSOS(
+          deviationMeters: deviation,
+        );
+        if (!mounted) return;
+        if (didTrigger) {
+          _showErrorSnackBar(
+            'Route deviation detected (> ${_journeyDeviationThresholdMeters.toInt()}m). SOS triggered.',
+          );
+        } else {
+          _showInfoSnackBar(
+            'Route deviation detected, but SOS is already active.',
+          );
+        }
+      }());
+    }
+  }
+
+  double _distanceToPolylineMeters(LatLng point, List<LatLng> polyline) {
+    if (polyline.length < 2) return double.infinity;
+    var nearestDistance = double.infinity;
+    for (var i = 0; i < polyline.length - 1; i++) {
+      final distance = _distanceToSegmentMeters(
+        point,
+        polyline[i],
+        polyline[i + 1],
+      );
+      if (distance < nearestDistance) {
+        nearestDistance = distance;
+      }
+    }
+    return nearestDistance;
+  }
+
+  void _showInfoSnackBar(String message) {
+    if (!mounted) return;
+    ScaffoldMessenger.of(context).showSnackBar(
+      SnackBar(content: Text(message), behavior: SnackBarBehavior.floating),
+    );
+  }
+
   @override
   Widget build(BuildContext context) {
     return Scaffold(
@@ -403,6 +586,20 @@ class _MapScreenState extends State<MapScreen> {
                   value: _heatmapController.isHeatmapVisible.value,
                   onChanged: (val) => _heatmapController.toggleHeatmap(),
                   activeThumbColor: Colors.redAccent,
+                ),
+                const Tooltip(
+                  message: 'Show Safety Heatmap',
+                  child: Icon(
+                    Icons.whatshot,
+                    size: 20,
+                    color: Colors.orangeAccent,
+                  ),
+                ),
+                Switch(
+                  value: _sosHeatmapController.isVisible.value,
+                  onChanged: (val) =>
+                      _sosHeatmapController.toggleVisibility(val),
+                  activeThumbColor: Colors.orangeAccent,
                 ),
                 PopupMenuButton<_AppMenuAction>(
                   icon: const Icon(Icons.more_vert),
@@ -496,6 +693,14 @@ class _MapScreenState extends State<MapScreen> {
                     onTap: _handleMapTap,
                     onLongPress: (tapPosition, point) =>
                         _showAddUnsafeZoneDialog(point),
+                    onPositionChanged: (position, hasGesture) {
+                      final bounds = position.visibleBounds;
+                      final zoom = position.zoom;
+                      _sosHeatmapController.refreshForViewport(
+                        bounds: bounds,
+                        zoom: zoom,
+                      );
+                    },
                   ),
                   children: [
                     TileLayer(
@@ -509,6 +714,12 @@ class _MapScreenState extends State<MapScreen> {
                           Polyline(
                             points: _sosRouteLocations,
                             color: Colors.blueAccent,
+                            strokeWidth: 5.0,
+                          ),
+                        if (_journeyRouteLocations.isNotEmpty)
+                          Polyline(
+                            points: _journeyRouteLocations,
+                            color: Colors.deepPurpleAccent,
                             strokeWidth: 5.0,
                           ),
                       ],
@@ -576,6 +787,17 @@ class _MapScreenState extends State<MapScreen> {
                               color: Colors.redAccent,
                             ),
                           ),
+                        if (_journeyDestination != null)
+                          Marker(
+                            point: _journeyDestination!,
+                            width: 80,
+                            height: 80,
+                            child: const Icon(
+                              Icons.flag_circle,
+                              size: 38,
+                              color: Colors.deepPurple,
+                            ),
+                          ),
                         ..._responderRoutes.values.map(
                           (route) => Marker(
                             point: route.currentLocation,
@@ -626,6 +848,14 @@ class _MapScreenState extends State<MapScreen> {
                         ),
                       ],
                     ),
+                    Obx(() {
+                      if (_sosHeatmapController.isVisible.value) {
+                        return CircleLayer(
+                          circles: _sosHeatmapController.buildCircleMarkers(),
+                        );
+                      }
+                      return const SizedBox.shrink();
+                    }),
                     Obx(() {
                       if (_heatmapController.isHeatmapVisible.value) {
                         return CircleLayer(
@@ -716,6 +946,65 @@ class _MapScreenState extends State<MapScreen> {
                 },
               ),
             ),
+          if (_currentPosition != null)
+            Positioned(
+              left: 16,
+              right: 16,
+              bottom: _selectedResponderUid != null ? 180 : 16,
+              child: Card(
+                child: Padding(
+                  padding: const EdgeInsets.symmetric(
+                    horizontal: 12,
+                    vertical: 10,
+                  ),
+                  child: Row(
+                    children: [
+                      Expanded(
+                        child: Text(
+                          _isJourneyActive
+                              ? (_journeyDeviationMeters == null
+                                    ? 'Journey active'
+                                    : 'Deviation: ${_journeyDeviationMeters!.toStringAsFixed(0)}m')
+                              : _isSelectingJourneyDestination
+                              ? 'Tap map to pick destination'
+                              : 'Journey Guard',
+                          maxLines: 2,
+                          overflow: TextOverflow.ellipsis,
+                          style: const TextStyle(fontWeight: FontWeight.w600),
+                        ),
+                      ),
+                      const SizedBox(width: 8),
+                      if (!_isJourneyActive)
+                        TextButton(
+                          onPressed: _enableJourneyDestinationSelection,
+                          child: const Text('Choose'),
+                        ),
+                      if (!_isJourneyActive &&
+                          _journeyRouteLocations.isNotEmpty)
+                        FilledButton(
+                          onPressed: _startJourney,
+                          child: const Text('Start'),
+                        ),
+                      if (_isJourneyActive)
+                        FilledButton(
+                          onPressed: _endJourney,
+                          child: const Text('End'),
+                        ),
+                    ],
+                  ),
+                ),
+              ),
+            ),
+
+          Positioned(
+            bottom: 180,
+            right: 16,
+            child: Obx(() {
+              final score = _riskController.currentRiskScore.value;
+              if (score == null) return const SizedBox.shrink();
+              return _RiskLevelIndicator(score: score);
+            }),
+          ),
 
           if (_isLoading)
             Container(
@@ -1347,6 +1636,14 @@ class _MapScreenState extends State<MapScreen> {
   }
 
   void _handleMapTap(TapPosition tapPosition, LatLng point) {
+    if (_isSelectingJourneyDestination) {
+      setState(() {
+        _isSelectingJourneyDestination = false;
+      });
+      _setJourneyDestination(point);
+      return;
+    }
+
     final tappedRouteUid = _findTappedResponderRoute(point);
     if (tappedRouteUid != null) {
       _selectResponderRoute(tappedRouteUid);
@@ -2352,4 +2649,84 @@ enum _AppMenuAction {
   editProfile,
   history,
   logout,
+}
+
+class _RiskLevelIndicator extends StatelessWidget {
+  final double score;
+  const _RiskLevelIndicator({required this.score});
+
+  @override
+  Widget build(BuildContext context) {
+    Color riskColor;
+    if (score <= 30) {
+      riskColor = Colors.green;
+    } else if (score <= 60) {
+      riskColor = Colors.orange;
+    } else {
+      riskColor = Colors.redAccent;
+    }
+
+    return Container(
+      padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 10),
+      decoration: BoxDecoration(
+        color: Theme.of(context).cardColor.withOpacity(0.95),
+        borderRadius: BorderRadius.circular(16),
+        boxShadow: const [
+          BoxShadow(
+            color: Colors.black12,
+            blurRadius: 10,
+            offset: Offset(0, 4),
+          ),
+        ],
+        border: Border.all(color: riskColor.withOpacity(0.5), width: 1.5),
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.end,
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          Row(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              Container(
+                width: 12,
+                height: 12,
+                decoration: BoxDecoration(
+                  shape: BoxShape.circle,
+                  color: riskColor,
+                  boxShadow: [
+                    BoxShadow(
+                      color: riskColor.withOpacity(0.4),
+                      blurRadius: 4,
+                      spreadRadius: 1,
+                    ),
+                  ],
+                ),
+              ),
+              const SizedBox(width: 8),
+              Text(
+                "Risk: ${score.toInt()}",
+                style: const TextStyle(
+                  fontWeight: FontWeight.w800,
+                  fontSize: 16,
+                ),
+              ),
+            ],
+          ),
+          if (score > 60)
+            const Padding(
+              padding: EdgeInsets.only(top: 4),
+              child: Text(
+                "High Risk Area",
+                style: TextStyle(
+                  color: Colors.redAccent,
+                  fontWeight: FontWeight.bold,
+                  fontSize: 12,
+                  letterSpacing: 0.5,
+                ),
+              ),
+            ),
+        ],
+      ),
+    );
+  }
 }

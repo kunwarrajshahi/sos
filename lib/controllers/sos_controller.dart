@@ -271,6 +271,33 @@ class SosController extends GetxController {
     });
   }
 
+  bool canTriggerSosNow() {
+    return !(isLoading.value ||
+        isSendingEmergencyAlerts.value ||
+        isCountdown.value ||
+        isActiveBroadcast.value);
+  }
+
+  Future<bool> triggerAutoRouteDeviationSOS({
+    required double deviationMeters,
+  }) async {
+    if (!canTriggerSosNow()) {
+      return false;
+    }
+
+    await HistoryController.instanceOrCreate().recordJourneyEvent(
+      title: 'Auto SOS Triggered',
+      subtitle:
+          'Route deviation detected at ${deviationMeters.toStringAsFixed(0)}m',
+      metadata: {
+        'triggerSource': 'auto_route_deviation',
+        'deviationMeters': deviationMeters,
+      },
+    );
+    initiateSOSWorkflow(initialCountdown: 0);
+    return true;
+  }
+
   Future<void> cancelSOS() async {
     final settings = SosSettingsController.instanceOrCreate();
     _timer?.cancel();

@@ -11,7 +11,8 @@ import 'package:sensors_plus/sensors_plus.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 import 'package:url_launcher/url_launcher.dart';
 import 'package:vibration/vibration.dart';
-
+import 'package:permission_handler/permission_handler.dart';
+import 'package:speech_to_text/speech_to_text.dart';
 const double _strongShakeMagnitudeThreshold = 18.5;
 const double _axisDirectionThreshold = 11.0;
 const int _requiredStrongOscillations = 3;
@@ -276,6 +277,128 @@ void onStart(ServiceInstance service) async {
       }
     });
   });
+
+  // --- Voice SOS Engine ---
+  final SpeechToText speechToText = SpeechToText();
+  bool isListening = false;
+
+  Future<void> startVoiceScan() async {
+    if (isCountdownActive) return; // Prevent double trigger
+
+    try {
+      bool available = await speechToText.initialize(
+        onStatus: (status) async {
+          if (status == 'done' || status == 'notListening') {
+            isListening = false;
+            // Brief pause before auto-restart to prevent resource locking
+            await Future.delayed(const Duration(seconds: 2));
+            if (!isCountdownActive) {
+               startVoiceScan();
+            }
+          }
+        },
+        onError: (errorNotification) async {
+          isListening = false;
+          // Longer pause on actual errors (e.g., no microhone access initially)
+          await Future.delayed(const Duration(seconds: 4));
+          if (!isCountdownActive) {
+             startVoiceScan();
+          }
+        },
+      );
+
+      if (available && !isListening && !isCountdownActive) {
+        isListening = true;
+        await speechToText.listen(
+          onResult: (result) async {
+            if (isCountdownActive) return;
+
+            if (result.confidence > 0.0 && result.confidence < 0.6) {
+              return; // Ignore low confidence parses to avoid false triggers
+            }
+
+            final spokenWords = result.recognizedWords.toLowerCase();
+            if (spokenWords.contains('help me') ||
+                spokenWords.contains('save me') ||
+                spokenWords.contains('sos')) {
+              
+              isCountdownActive = true;
+              speechToText.stop();
+              
+              final hasVibrator = await Vibration.hasVibrator();
+              if (hasVibrator == true) {
+                Vibration.vibrate(pattern: [500, 200, 500, 200, 500]);
+              }
+
+              final prefs = await SharedPreferences.getInstance();
+              final executeAt = DateTime.now()
+                  .add(const Duration(seconds: 5)) // Custom 5 sec warning
+                  .millisecondsSinceEpoch;
+              await prefs.setInt('sos_execute_at', executeAt);
+              await prefs.setBool('is_sos_pending', true);
+
+              service.invoke('sos_triggered', {'executeAt': executeAt});
+
+              final flutterLocalNotificationsPlugin = FlutterLocalNotificationsPlugin();
+              const initializationSettingsAndroid = AndroidInitializationSettings('@mipmap/ic_launcher');
+              const initializationSettings = InitializationSettings(android: initializationSettingsAndroid);
+              await flutterLocalNotificationsPlugin.initialize(settings: initializationSettings);
+
+              await flutterLocalNotificationsPlugin.show(
+                id: 778, // Separate unique ID from shake
+                title: '🚨 Voice SOS Detected',
+                body: 'Sending alert in 5 seconds. Tap to cancel.',
+                notificationDetails: const NotificationDetails(
+                  android: AndroidNotificationDetails(
+                    'sos_wake_channel_v1',
+                    'SOS Critical Wake Lock',
+                    channelDescription: 'Voice SOS wake',
+                    importance: Importance.max,
+                    priority: Priority.max,
+                    fullScreenIntent: true,
+                    visibility: NotificationVisibility.public,
+                    ongoing: true,
+                  ),
+                ),
+              );
+
+              try {
+                await launchUrl(
+                  Uri.parse('saferoute://sos'),
+                  mode: LaunchMode.externalApplication,
+                );
+              } catch (e) {
+                debugPrint("Deep link bypass failed: $e");
+              }
+
+              Timer(const Duration(seconds: 5), () async {
+                isCountdownActive = false;
+                
+                await prefs.reload();
+                final isPending = prefs.getBool('is_sos_pending') ?? false;
+
+                if (isPending) {
+                  await _executeBackgroundSOS();
+                  await prefs.setBool('is_sos_pending', false);
+                }
+                
+                // Safely resume endless voice scanning
+                startVoiceScan();
+              });
+            }
+          },
+          listenMode: ListenMode.dictation,
+          partialResults: false,
+        );
+      }
+    } catch (e) {
+       debugPrint("Speech recognizer exception: $e");
+       isListening = false;
+    }
+  }
+
+  // Kickstart voice tracking loop
+  startVoiceScan();
 }
 
 Future<void> _executeBackgroundSOS() async {

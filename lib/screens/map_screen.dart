@@ -13,6 +13,7 @@ import '../controllers/heatmap_controller.dart';
 import '../controllers/history_controller.dart';
 import '../controllers/rescue_invite_controller.dart';
 import '../controllers/rescue_stats_controller.dart';
+import '../controllers/sos_call_controller.dart';
 import '../services/routing_service.dart';
 import '../controllers/sos_listener_controller.dart';
 import '../screens/safe_route_menu_screens.dart';
@@ -32,6 +33,7 @@ class _MapScreenState extends State<MapScreen> {
   final MapController _mapController = MapController();
   final SosController _sosController = Get.put(SosController());
   final HeatmapController _heatmapController = Get.put(HeatmapController());
+  final SosCallController _sosCallController = Get.find<SosCallController>();
 
   Position? _currentPosition;
   String? _errorMessage;
@@ -44,15 +46,17 @@ class _MapScreenState extends State<MapScreen> {
   String? _selectedResponderUid;
   LatLng? _victimLocation;
   StreamSubscription<DocumentSnapshot<Map<String, dynamic>>>?
-      _sessionSubscription;
+  _sessionSubscription;
   Worker? _broadcastWorker;
   Worker? _rescueWorker;
+  Worker? _callWorker;
   final Map<String, _ResponderRouteInfo> _responderRoutes = {};
   final Map<String, _CachedResponderRoute> _routeCache = {};
   Worker? _sosWorker;
   StreamSubscription<Position>? _positionStreamSubscription;
   LatLng? _lastPublishedVictimLocation;
   LatLng? _lastPublishedResponderLocation;
+  bool _isPostSafeSheetVisible = false;
 
   @override
   void initState() {
@@ -65,6 +69,11 @@ class _MapScreenState extends State<MapScreen> {
     });
     _rescueWorker = ever(SosListenerController.instance.activeSosUid, (_) {
       _bindActiveSessionTracking();
+    });
+    _callWorker = ever(_sosCallController.showPostSafeActions, (bool show) {
+      if (show && !_isPostSafeSheetVisible) {
+        _showPostSafeActionsSheet();
+      }
     });
 
     _sosWorker = ever(SosListenerController.instance.activeSosTarget, (
@@ -87,6 +96,7 @@ class _MapScreenState extends State<MapScreen> {
     _sosWorker?.dispose();
     _broadcastWorker?.dispose();
     _rescueWorker?.dispose();
+    _callWorker?.dispose();
     _sessionSubscription?.cancel();
     _positionStreamSubscription?.cancel();
     super.dispose();
@@ -512,7 +522,11 @@ class _MapScreenState extends State<MapScreen> {
                           return Polyline(
                             points: route.route.points,
                             color: routeColor.withOpacity(
-                              isSelected ? 0.95 : hasSelection ? 0.25 : 0.68,
+                              isSelected
+                                  ? 0.95
+                                  : hasSelection
+                                  ? 0.25
+                                  : 0.68,
                             ),
                             strokeWidth: isSelected ? 6 : 4,
                           );
@@ -566,19 +580,23 @@ class _MapScreenState extends State<MapScreen> {
                           (route) => Marker(
                             point: route.currentLocation,
                             width: route.uid == _selectedResponderUid ? 92 : 72,
-                            height: route.uid == _selectedResponderUid ? 92 : 72,
+                            height: route.uid == _selectedResponderUid
+                                ? 92
+                                : 72,
                             child: GestureDetector(
-                          onTap: () => _selectResponderRoute(route.uid),
-                          child: Column(
-                            mainAxisSize: MainAxisSize.min,
-                            children: [
-                              Icon(
-                                route.uid == _selectedResponderUid
-                                    ? Icons.shield
-                                    : Icons.shield_outlined,
-                                size: route.uid == _selectedResponderUid ? 34 : 28,
-                                color: _routeColorForUid(route.uid),
-                              ),
+                              onTap: () => _selectResponderRoute(route.uid),
+                              child: Column(
+                                mainAxisSize: MainAxisSize.min,
+                                children: [
+                                  Icon(
+                                    route.uid == _selectedResponderUid
+                                        ? Icons.shield
+                                        : Icons.shield_outlined,
+                                    size: route.uid == _selectedResponderUid
+                                        ? 34
+                                        : 28,
+                                    color: _routeColorForUid(route.uid),
+                                  ),
                                   if (route.uid == _selectedResponderUid)
                                     Container(
                                       margin: const EdgeInsets.only(top: 2),
@@ -588,7 +606,9 @@ class _MapScreenState extends State<MapScreen> {
                                       ),
                                       decoration: BoxDecoration(
                                         color: Colors.black87,
-                                        borderRadius: BorderRadius.circular(999),
+                                        borderRadius: BorderRadius.circular(
+                                          999,
+                                        ),
                                       ),
                                       child: Text(
                                         route.displayName,
@@ -610,8 +630,7 @@ class _MapScreenState extends State<MapScreen> {
                       if (_heatmapController.isHeatmapVisible.value) {
                         return CircleLayer(
                           circles: _heatmapController.unsafeZones.map((zone) {
-                            final isSelected =
-                                zone.id == _selectedUnsafeZoneId;
+                            final isSelected = zone.id == _selectedUnsafeZoneId;
                             return CircleMarker(
                               point: zone.point,
                               color: Colors.red.withOpacity(
@@ -662,6 +681,7 @@ class _MapScreenState extends State<MapScreen> {
                     ? RescueInviteController.instance.shareActiveRescueInvite
                     : null,
                 joinedViaInvite: joinedViaInvite,
+                callStatusText: _sosCallController.callStatusText.value,
               ),
             );
           }),
@@ -791,6 +811,25 @@ class _MapScreenState extends State<MapScreen> {
                             textAlign: TextAlign.center,
                           ),
                         ),
+                        Obx(() {
+                          final callStatus =
+                              _sosCallController.callStatusText.value;
+                          if (callStatus.isEmpty) {
+                            return const SizedBox.shrink();
+                          }
+                          return Padding(
+                            padding: const EdgeInsets.only(top: 10),
+                            child: Text(
+                              callStatus,
+                              style: const TextStyle(
+                                color: Colors.lightBlueAccent,
+                                fontSize: 14,
+                                fontWeight: FontWeight.w600,
+                              ),
+                              textAlign: TextAlign.center,
+                            ),
+                          );
+                        }),
                         const SizedBox(height: 14),
                         Obx(
                           () => Container(
@@ -818,7 +857,10 @@ class _MapScreenState extends State<MapScreen> {
                                   'Failed: ${_sosController.smsFailedCount.value}',
                                   style: const TextStyle(color: Colors.white70),
                                 ),
-                                if (_sosController.smsRetryStatus.value.isNotEmpty)
+                                if (_sosController
+                                    .smsRetryStatus
+                                    .value
+                                    .isNotEmpty)
                                   Padding(
                                     padding: const EdgeInsets.only(top: 6),
                                     child: Text(
@@ -834,14 +876,17 @@ class _MapScreenState extends State<MapScreen> {
                           ),
                         ),
                         Obx(
-                          () => _sosController.availableSmsSubscriptions.length > 1
+                          () =>
+                              _sosController.availableSmsSubscriptions.length >
+                                  1
                               ? Padding(
                                   padding: const EdgeInsets.only(top: 12),
                                   child: SizedBox(
                                     width: double.infinity,
                                     height: 46,
                                     child: OutlinedButton.icon(
-                                      onPressed: _sosController.showSmsSubscriptionPicker,
+                                      onPressed: _sosController
+                                          .showSmsSubscriptionPicker,
                                       icon: const Icon(Icons.sim_card_outlined),
                                       label: const Text('Choose SMS SIM'),
                                       style: OutlinedButton.styleFrom(
@@ -899,33 +944,34 @@ class _MapScreenState extends State<MapScreen> {
                           height: 48,
                           child: Obx(
                             () => ElevatedButton.icon(
-                            onPressed: _sosController.isCompletingRescue.value
-                                ? null
-                                : _sosController.stopActiveSOS,
-                            icon: _sosController.isCompletingRescue.value
-                                ? const SizedBox(
-                                    width: 18,
-                                    height: 18,
-                                    child: CircularProgressIndicator(
-                                      strokeWidth: 2,
-                                      color: Colors.white,
-                                    ),
-                                  )
-                                : const Icon(Icons.verified_user),
-                            style: ElevatedButton.styleFrom(
-                              backgroundColor: Colors.green,
-                              foregroundColor: Colors.white,
-                            ),
-                            label: Text(
-                              _sosController.isCompletingRescue.value
-                                  ? "COMPLETING RESCUE..."
-                                  : "MARK AS SAFE (STOP SOS)",
-                              style: TextStyle(
-                                fontSize: 16,
-                                fontWeight: FontWeight.bold,
+                              onPressed: _sosController.isCompletingRescue.value
+                                  ? null
+                                  : _sosController.stopActiveSOS,
+                              icon: _sosController.isCompletingRescue.value
+                                  ? const SizedBox(
+                                      width: 18,
+                                      height: 18,
+                                      child: CircularProgressIndicator(
+                                        strokeWidth: 2,
+                                        color: Colors.white,
+                                      ),
+                                    )
+                                  : const Icon(Icons.verified_user),
+                              style: ElevatedButton.styleFrom(
+                                backgroundColor: Colors.green,
+                                foregroundColor: Colors.white,
+                              ),
+                              label: Text(
+                                _sosController.isCompletingRescue.value
+                                    ? "COMPLETING RESCUE..."
+                                    : "MARK AS SAFE (STOP SOS)",
+                                style: TextStyle(
+                                  fontSize: 16,
+                                  fontWeight: FontWeight.bold,
+                                ),
                               ),
                             ),
-                          )),
+                          ),
                         ),
                         const SizedBox(height: 16),
                         SizedBox(
@@ -968,6 +1014,24 @@ class _MapScreenState extends State<MapScreen> {
                           ),
                           textAlign: TextAlign.center,
                         ),
+                        Obx(() {
+                          final callStatus =
+                              _sosCallController.callStatusText.value;
+                          if (callStatus.isEmpty) {
+                            return const SizedBox.shrink();
+                          }
+                          return Padding(
+                            padding: const EdgeInsets.only(top: 12),
+                            child: Text(
+                              callStatus,
+                              style: const TextStyle(
+                                color: Colors.lightBlueAccent,
+                                fontWeight: FontWeight.w600,
+                              ),
+                              textAlign: TextAlign.center,
+                            ),
+                          );
+                        }),
                         if (_sosController.isSendingEmergencyAlerts.value) ...[
                           const SizedBox(height: 12),
                           Text(
@@ -1006,32 +1070,33 @@ class _MapScreenState extends State<MapScreen> {
                   if (_sosController.isActiveBroadcast.value)
                     Obx(
                       () => FloatingActionButton.extended(
-                      heroTag: 'stopSosBtn',
-                      onPressed: _sosController.isCompletingRescue.value
-                          ? null
-                          : () => _sosController.stopActiveSOS(),
-                      backgroundColor: Colors.black,
-                      foregroundColor: Colors.greenAccent,
-                      icon: _sosController.isCompletingRescue.value
-                          ? const SizedBox(
-                              width: 22,
-                              height: 22,
-                              child: CircularProgressIndicator(
-                                strokeWidth: 2,
-                                color: Colors.greenAccent,
-                              ),
-                            )
-                          : const Icon(Icons.verified_user, size: 28),
-                      label: Text(
-                        _sosController.isCompletingRescue.value
-                            ? "COMPLETING..."
-                            : "I'M SAFE",
-                        style: TextStyle(
-                          fontWeight: FontWeight.bold,
-                          fontSize: 18,
+                        heroTag: 'stopSosBtn',
+                        onPressed: _sosController.isCompletingRescue.value
+                            ? null
+                            : () => _sosController.stopActiveSOS(),
+                        backgroundColor: Colors.black,
+                        foregroundColor: Colors.greenAccent,
+                        icon: _sosController.isCompletingRescue.value
+                            ? const SizedBox(
+                                width: 22,
+                                height: 22,
+                                child: CircularProgressIndicator(
+                                  strokeWidth: 2,
+                                  color: Colors.greenAccent,
+                                ),
+                              )
+                            : const Icon(Icons.verified_user, size: 28),
+                        label: Text(
+                          _sosController.isCompletingRescue.value
+                              ? "COMPLETING..."
+                              : "I'M SAFE",
+                          style: TextStyle(
+                            fontWeight: FontWeight.bold,
+                            fontSize: 18,
+                          ),
                         ),
                       ),
-                    ))
+                    )
                   else
                     _PulsingSosButton(
                       onPressed: () => _sosController.initiateSOSWorkflow(),
@@ -1095,41 +1160,44 @@ class _MapScreenState extends State<MapScreen> {
         .doc(sessionId)
         .snapshots()
         .listen((doc) async {
-      final data = doc.data();
-      if (data == null || data['active'] != true) {
-        if (!_sosController.isActiveBroadcast.value) {
-          SosListenerController.instance.clearActiveNavigation();
-        }
-        _clearSharedSessionUi();
-        return;
-      }
+          final data = doc.data();
+          if (data == null || data['active'] != true) {
+            if (!_sosController.isActiveBroadcast.value) {
+              SosListenerController.instance.clearActiveNavigation();
+            }
+            _clearSharedSessionUi();
+            return;
+          }
 
-      final victim = _extractVictimLocation(data);
-      if (victim == null) {
-        return;
-      }
+          final victim = _extractVictimLocation(data);
+          if (victim == null) {
+            return;
+          }
 
-      final responderMeta =
-          Map<String, dynamic>.from(data['respondersMeta'] as Map? ?? {});
-      final responders =
-          await _parseResponderRoutesAsync(responderMeta, victim);
+          final responderMeta = Map<String, dynamic>.from(
+            data['respondersMeta'] as Map? ?? {},
+          );
+          final responders = await _parseResponderRoutesAsync(
+            responderMeta,
+            victim,
+          );
 
-      if (!_sosController.isActiveBroadcast.value) {
-        SosListenerController.instance.activeSosTarget.value = victim;
-      }
+          if (!_sosController.isActiveBroadcast.value) {
+            SosListenerController.instance.activeSosTarget.value = victim;
+          }
 
-      if (!mounted) return;
-      setState(() {
-        _victimLocation = victim;
-        _responderRoutes
-          ..clear()
-          ..addEntries(responders.entries);
-        if (_selectedResponderUid != null &&
-            !_responderRoutes.containsKey(_selectedResponderUid)) {
-          _selectedResponderUid = null;
-        }
-      });
-    });
+          if (!mounted) return;
+          setState(() {
+            _victimLocation = victim;
+            _responderRoutes
+              ..clear()
+              ..addEntries(responders.entries);
+            if (_selectedResponderUid != null &&
+                !_responderRoutes.containsKey(_selectedResponderUid)) {
+              _selectedResponderUid = null;
+            }
+          });
+        });
   }
 
   Future<Map<String, _ResponderRouteInfo>> _parseResponderRoutesAsync(
@@ -1357,7 +1425,8 @@ class _MapScreenState extends State<MapScreen> {
   }
 
   double _distanceToSegmentMeters(LatLng point, LatLng start, LatLng end) {
-    final avgLat = ((start.latitude + end.latitude + point.latitude) / 3) *
+    final avgLat =
+        ((start.latitude + end.latitude + point.latitude) / 3) *
         3.141592653589793 /
         180;
     final metersPerLat = 111320.0;
@@ -1395,7 +1464,8 @@ class _MapScreenState extends State<MapScreen> {
         final isUnsafeNow = _isCurrentlyUnsafe(zone.timeStart, zone.timeEnd);
         final isNightRange = _isNightRange(zone.timeStart, zone.timeEnd);
         final reasonLabel = _formatReason(zone.reason);
-        final subtitle = 'Unsafe from '
+        final subtitle =
+            'Unsafe from '
             '${_formatZoneTime(zone.timeStart)} to ${_formatZoneTime(zone.timeEnd)}';
 
         return SafeArea(
@@ -1416,9 +1486,7 @@ class _MapScreenState extends State<MapScreen> {
                     offset: Offset(0, 12),
                   ),
                 ],
-                border: Border.all(
-                  color: Colors.red.withOpacity(0.14),
-                ),
+                border: Border.all(color: Colors.red.withOpacity(0.14)),
               ),
               child: Column(
                 mainAxisSize: MainAxisSize.min,
@@ -1454,9 +1522,9 @@ class _MapScreenState extends State<MapScreen> {
                               zone.areaName ?? 'Community reported zone',
                               style: TextStyle(
                                 fontSize: 13,
-                                color: Theme.of(context)
-                                    .colorScheme
-                                    .onSurfaceVariant,
+                                color: Theme.of(
+                                  context,
+                                ).colorScheme.onSurfaceVariant,
                               ),
                             ),
                           ],
@@ -1581,7 +1649,9 @@ class _MapScreenState extends State<MapScreen> {
 
     final startMinutes = startTime.hour * 60 + startTime.minute;
     final endMinutes = endTime.hour * 60 + endTime.minute;
-    return startMinutes >= 18 * 60 || endMinutes <= 6 * 60 || startMinutes > endMinutes;
+    return startMinutes >= 18 * 60 ||
+        endMinutes <= 6 * 60 ||
+        startMinutes > endMinutes;
   }
 
   void _selectResponderRoute(String uid) {
@@ -1628,6 +1698,125 @@ class _MapScreenState extends State<MapScreen> {
         behavior: SnackBarBehavior.floating,
       ),
     );
+  }
+
+  Future<void> _showPostSafeActionsSheet() async {
+    if (!mounted) return;
+
+    _isPostSafeSheetVisible = true;
+    await Get.bottomSheet<void>(
+      SafeArea(
+        child: Container(
+          padding: const EdgeInsets.fromLTRB(20, 18, 20, 24),
+          decoration: BoxDecoration(
+            color: Theme.of(context).colorScheme.surface,
+            borderRadius: const BorderRadius.vertical(top: Radius.circular(28)),
+          ),
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Center(
+                child: Container(
+                  width: 46,
+                  height: 5,
+                  decoration: BoxDecoration(
+                    color: Colors.grey.shade400,
+                    borderRadius: BorderRadius.circular(999),
+                  ),
+                ),
+              ),
+              const SizedBox(height: 18),
+              const Text(
+                'Rescue marked safe',
+                style: TextStyle(fontSize: 20, fontWeight: FontWeight.w700),
+              ),
+              const SizedBox(height: 8),
+              Obx(
+                () => Text(
+                  _sosCallController.callStatusText.value.isEmpty
+                      ? 'You can keep the emergency call active, end it now, or notify contacts that you are safe.'
+                      : _sosCallController.callStatusText.value,
+                  style: TextStyle(
+                    color: Colors.grey.shade700,
+                    fontSize: 14,
+                    height: 1.35,
+                  ),
+                ),
+              ),
+              const SizedBox(height: 18),
+              SizedBox(
+                width: double.infinity,
+                child: FilledButton.icon(
+                  onPressed: () {
+                    _sosCallController.dismissPostSafeActions();
+                    Get.back<void>();
+                  },
+                  icon: const Icon(Icons.call),
+                  label: const Text('Continue Call'),
+                ),
+              ),
+              const SizedBox(height: 10),
+              SizedBox(
+                width: double.infinity,
+                child: Obx(
+                  () => OutlinedButton.icon(
+                    onPressed: _sosCallController.isEndingCall.value
+                        ? null
+                        : () async {
+                            await _sosCallController.endActiveCallAfterSafe();
+                            if (Get.isBottomSheetOpen == true) {
+                              Get.back<void>();
+                            }
+                          },
+                    icon: _sosCallController.isEndingCall.value
+                        ? const SizedBox(
+                            width: 18,
+                            height: 18,
+                            child: CircularProgressIndicator(strokeWidth: 2),
+                          )
+                        : const Icon(Icons.call_end),
+                    label: Text(
+                      _sosCallController.isEndingCall.value
+                          ? 'Ending Call...'
+                          : 'End Call',
+                    ),
+                    style: OutlinedButton.styleFrom(
+                      foregroundColor: Colors.redAccent,
+                      side: const BorderSide(color: Colors.redAccent),
+                    ),
+                  ),
+                ),
+              ),
+              const SizedBox(height: 10),
+              SizedBox(
+                width: double.infinity,
+                child: TextButton.icon(
+                  onPressed: () async {
+                    await _sosCallController.notifyContactsSafe();
+                    if (mounted) {
+                      ScaffoldMessenger.of(context).showSnackBar(
+                        const SnackBar(
+                          content: Text('Safe status shared with contacts'),
+                          behavior: SnackBarBehavior.floating,
+                        ),
+                      );
+                    }
+                  },
+                  icon: const Icon(Icons.verified_user_outlined),
+                  label: const Text("Notify contacts I'm safe"),
+                ),
+              ),
+            ],
+          ),
+        ),
+      ),
+      isDismissible: false,
+      enableDrag: false,
+    ).whenComplete(() {
+      _isPostSafeSheetVisible = false;
+      _sosCallController.dismissPostSafeActions();
+    });
   }
 }
 
@@ -1691,6 +1880,7 @@ class _RouteSummaryCard extends StatelessWidget {
     required this.onLeaveRescue,
     required this.onShareInvite,
     required this.joinedViaInvite,
+    required this.callStatusText,
   });
 
   final String distanceLabel;
@@ -1699,6 +1889,7 @@ class _RouteSummaryCard extends StatelessWidget {
   final VoidCallback onLeaveRescue;
   final Future<void> Function()? onShareInvite;
   final bool joinedViaInvite;
+  final String callStatusText;
 
   @override
   Widget build(BuildContext context) {
@@ -1725,10 +1916,7 @@ class _RouteSummaryCard extends StatelessWidget {
               offset: Offset(0, 10),
             ),
           ],
-          border: Border.all(
-            color: Colors.white.withOpacity(0.2),
-            width: 1,
-          ),
+          border: Border.all(color: Colors.white.withOpacity(0.2), width: 1),
         ),
         child: Column(
           crossAxisAlignment: CrossAxisAlignment.start,
@@ -1788,10 +1976,46 @@ class _RouteSummaryCard extends StatelessWidget {
                 height: 1.25,
               ),
             ),
+            if (callStatusText.trim().isNotEmpty) ...[
+              const SizedBox(height: 10),
+              Container(
+                padding: const EdgeInsets.symmetric(
+                  horizontal: 12,
+                  vertical: 8,
+                ),
+                decoration: BoxDecoration(
+                  color: Colors.white.withOpacity(0.14),
+                  borderRadius: BorderRadius.circular(14),
+                ),
+                child: Row(
+                  children: [
+                    const Icon(
+                      Icons.call_rounded,
+                      color: Colors.white,
+                      size: 16,
+                    ),
+                    const SizedBox(width: 8),
+                    Expanded(
+                      child: Text(
+                        callStatusText,
+                        style: const TextStyle(
+                          color: Colors.white,
+                          fontSize: 12,
+                          fontWeight: FontWeight.w600,
+                        ),
+                      ),
+                    ),
+                  ],
+                ),
+              ),
+            ],
             if (joinedViaInvite) ...[
               const SizedBox(height: 12),
               Container(
-                padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
+                padding: const EdgeInsets.symmetric(
+                  horizontal: 12,
+                  vertical: 8,
+                ),
                 decoration: BoxDecoration(
                   color: Colors.white.withOpacity(0.14),
                   borderRadius: BorderRadius.circular(999),
@@ -1855,10 +2079,7 @@ class _RouteSummaryCard extends StatelessWidget {
 }
 
 class _RouteMetricChip extends StatelessWidget {
-  const _RouteMetricChip({
-    required this.icon,
-    required this.label,
-  });
+  const _RouteMetricChip({required this.icon, required this.label});
 
   final IconData icon;
   final String label;
@@ -1922,10 +2143,7 @@ class _UnsafeInfoChip extends StatelessWidget {
 }
 
 class _RescueStatsBanner extends StatelessWidget {
-  const _RescueStatsBanner({
-    required this.totalLabel,
-    this.personalLabel,
-  });
+  const _RescueStatsBanner({required this.totalLabel, this.personalLabel});
 
   final String totalLabel;
   final String? personalLabel;

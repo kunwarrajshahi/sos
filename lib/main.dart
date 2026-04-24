@@ -5,6 +5,7 @@ import 'screens/auth_wrapper.dart';
 import 'controllers/auth_controller.dart';
 import 'controllers/rescue_invite_controller.dart';
 import 'controllers/rescue_stats_controller.dart';
+import 'controllers/sos_call_controller.dart';
 import 'controllers/sos_listener_controller.dart';
 import 'services/background_shake_service.dart';
 
@@ -38,6 +39,7 @@ class SafeRouteApp extends StatelessWidget {
   Widget build(BuildContext context) {
     Get.put(AuthController());
     Get.put(SosListenerController());
+    Get.put(SosCallController());
     Get.put(RescueInviteController());
     Get.put(RescueStatsController());
     return GetMaterialApp(

@@ -16,6 +16,7 @@ import 'package:permission_handler/permission_handler.dart';
 import 'contact_controller.dart';
 import 'history_controller.dart';
 import 'rescue_invite_controller.dart';
+import 'sos_call_controller.dart';
 import 'sos_listener_controller.dart';
 import 'sos_settings_controller.dart';
 
@@ -25,6 +26,7 @@ class SosController extends GetxController {
   static const Duration _smsSendGap = Duration(seconds: 3);
   static const Duration _smsRetryGap = Duration(seconds: 3);
   static const int _smsMaxAttemptsPerContact = 2;
+  static const int _smsMaxSimSwitchesPerAttempt = 2;
   static const MethodChannel _smsChannel = MethodChannel('safe_route/sms');
   static const String _preferredSmsSubscriptionPrefsKey =
       'preferred_sms_subscription_id';
@@ -61,9 +63,7 @@ class SosController extends GetxController {
           final remainder =
               ((executeAt - DateTime.now().millisecondsSinceEpoch) / 1000)
                   .ceil();
-          initiateSOSWorkflow(
-            initialCountdown: remainder > 0 ? remainder : 3,
-          );
+          initiateSOSWorkflow(initialCountdown: remainder > 0 ? remainder : 3);
         } else {
           initiateSOSWorkflow(initialCountdown: 3);
         }
@@ -94,11 +94,18 @@ class SosController extends GetxController {
           final isFresh = startedAtMs == null
               ? true
               : DateTime.now().millisecondsSinceEpoch - startedAtMs <=
-                  _sosFreshnessWindowMs;
+                    _sosFreshnessWindowMs;
 
           if (isFresh) {
             isSent.value = true;
             isActiveBroadcast.value = true;
+            if (Get.isRegistered<SosCallController>()) {
+              unawaited(
+                SosCallController.instance.restoreActiveSessionIfNeeded(
+                  sessionId: uid,
+                ),
+              );
+            }
           } else {
             await FirebaseFirestore.instance
                 .collection('active_sos')
@@ -224,8 +231,7 @@ class SosController extends GetxController {
   }
 
   void initiateSOSWorkflow({int? initialCountdown}) async {
-    if (
-        isLoading.value ||
+    if (isLoading.value ||
         isSendingEmergencyAlerts.value ||
         isCountdown.value ||
         isActiveBroadcast.value) {
@@ -277,9 +283,7 @@ class SosController extends GetxController {
   }
 
   Future<void> executeSOS() async {
-    if (
-        isLoading.value ||
-        isActiveBroadcast.value) {
+    if (isLoading.value || isActiveBroadcast.value) {
       return;
     }
 
@@ -351,16 +355,6 @@ class SosController extends GetxController {
         debugPrint("Error broadcasting SOS: \$e");
       }
 
-      generatedMessage = await _buildSosMessage(
-        lat: lat,
-        lng: lng,
-        sessionId: uid,
-      );
-      await (await SharedPreferences.getInstance()).setString(
-        'sos_msg',
-        generatedMessage,
-      );
-
       isLoading.value = false;
       isSent.value = true;
       isActiveBroadcast.value = true;
@@ -369,10 +363,26 @@ class SosController extends GetxController {
         locationLabel: 'Emergency SOS dispatched',
       );
 
-      unawaited(_dispatchEmergencySmsInBackground(
-        contactsList: contactsList,
-        contactCtrl: contactCtrl,
-      ));
+      if (Get.isRegistered<SosCallController>()) {
+        unawaited(
+          SosCallController.instance.startParallelCallingForSos(
+            sessionId: uid,
+            emergencyContacts: contactsList,
+            latitude: position.latitude,
+            longitude: position.longitude,
+          ),
+        );
+      }
+
+      unawaited(
+        _dispatchEmergencySmsInBackground(
+          contactsList: contactsList,
+          contactCtrl: contactCtrl,
+          lat: lat,
+          lng: lng,
+          sessionId: uid,
+        ),
+      );
     } catch (e) {
       isLoading.value = false;
       smsStatusMessage.value = 'Emergency sending failed';
@@ -454,9 +464,12 @@ class SosController extends GetxController {
   Future<void> _dispatchEmergencySmsInBackground({
     required List<String> contactsList,
     required ContactController contactCtrl,
+    required String lat,
+    required String lng,
+    required String sessionId,
   }) async {
     if (contactsList.isEmpty) {
-      smsStatusMessage.value = 'No emergency contacts saved';
+      smsStatusMessage.value = 'Connecting to emergency contacts...';
       Get.snackbar(
         "Warning",
         "No emergency contacts found.",
@@ -470,14 +483,12 @@ class SosController extends GetxController {
 
     final smsGranted = await contactCtrl.checkAndRequestSmsPermission();
     if (!smsGranted) {
-      smsStatusMessage.value = 'SMS permission denied';
-      Get.snackbar(
-        "SMS Permission Needed",
-        "Emergency SMS could not be sent because SMS permission was not granted.",
-        snackPosition: SnackPosition.BOTTOM,
-        backgroundColor: Colors.black87,
-        colorText: Colors.redAccent,
-        duration: const Duration(seconds: 4),
+      smsStatusMessage.value = 'Trying alternative communication methods...';
+      smsRetryStatus.value = 'SMS permission unavailable. Switching channel...';
+      debugPrint('[SOS SMS] SEND_SMS permission denied. Triggering fallback.');
+      await _triggerAlternativeCommunicationFallback(
+        reason: SmsFailureReason.permissionDenied,
+        autoShare: true,
       );
       return;
     }
@@ -485,6 +496,15 @@ class SosController extends GetxController {
     isSendingEmergencyAlerts.value = true;
     smsStatusMessage.value = 'Sending emergency alerts...';
     await refreshSmsSubscriptions();
+    generatedMessage = await _buildSosMessage(
+      lat: lat,
+      lng: lng,
+      sessionId: sessionId,
+    );
+    await (await SharedPreferences.getInstance()).setString(
+      'sos_msg',
+      generatedMessage,
+    );
 
     Get.snackbar(
       "Sending SOS...",
@@ -507,24 +527,21 @@ class SosController extends GetxController {
           colorText: Colors.white,
         );
       } else if (sentCount > 0) {
-        smsStatusMessage.value = 'Emergency alerts sent with partial failures';
+        smsStatusMessage.value = 'Contacting help...';
         Get.snackbar(
-          "SOS sent with issues",
-          "Sent to $sentCount contact(s). Failed for $failedCount contact(s).",
+          "SOS active",
+          "Some alerts are still being retried through backup methods.",
           snackPosition: SnackPosition.TOP,
           backgroundColor: Colors.orange,
           colorText: Colors.white,
           duration: const Duration(seconds: 5),
         );
       } else {
-        smsStatusMessage.value = 'All emergency alert sends failed';
-        Get.snackbar(
-          "SMS Failed",
-          "Unable to send SOS SMS right now. Rescue broadcast will continue.",
-          snackPosition: SnackPosition.BOTTOM,
-          backgroundColor: Colors.redAccent,
-          colorText: Colors.white,
-          duration: const Duration(seconds: 5),
+        smsStatusMessage.value = 'Trying alternative communication methods...';
+        smsRetryStatus.value = 'Switching to backup sharing methods...';
+        await _triggerAlternativeCommunicationFallback(
+          reason: dispatchResult.lastFailureReason ?? SmsFailureReason.unknown,
+          autoShare: true,
         );
       }
     } finally {
@@ -597,22 +614,26 @@ class SosController extends GetxController {
     List<String> contactsList,
   ) async {
     final failedNumbers = <String>[];
+    SmsFailureReason? lastFailureReason;
     var sentCount = 0;
 
     for (var index = 0; index < contactsList.length; index++) {
       final number = contactsList[index];
       smsStatusMessage.value =
           'Sending emergency alerts... ${index + 1}/${contactsList.length}';
-      smsRetryStatus.value = 'Sending to $number';
-      final didSend = await sendSOSMessage(number);
-      if (didSend) {
+      smsRetryStatus.value = 'Sending to ${_maskContact(number)}';
+      final outcome = await _sendSOSMessage(number);
+      if (outcome.success) {
         sentCount++;
         smsSentCount.value = sentCount;
-        smsRetryStatus.value = 'Delivered to $number';
+        smsRetryStatus.value = 'Delivered to ${_maskContact(number)}';
       } else {
         failedNumbers.add(number);
         smsFailedCount.value = failedNumbers.length;
-        smsRetryStatus.value = 'Failed for $number';
+        lastFailureReason = outcome.failureReason;
+        smsRetryStatus.value =
+            outcome.userFacingStatus ??
+            'Trying backup delivery for ${_maskContact(number)}...';
       }
 
       if (index < contactsList.length - 1) {
@@ -628,46 +649,94 @@ class SosController extends GetxController {
     return _SmsDispatchResult(
       sentCount: sentCount,
       failedNumbers: failedNumbers,
+      lastFailureReason: lastFailureReason,
     );
   }
 
-  Future<bool> sendSOSMessage(String phoneNumber) async {
+  Future<_SmsSendOutcome> _sendSOSMessage(String phoneNumber) async {
     if (generatedMessage.isEmpty) {
-      return false;
+      return const _SmsSendOutcome(
+        success: false,
+        failureReason: SmsFailureReason.unknown,
+        userFacingStatus: 'Preparing backup communication...',
+      );
     }
 
-    for (var attempt = 1; attempt <= _smsMaxAttemptsPerContact; attempt++) {
-      try {
-        final result = await _sendDirectSmsNative(phoneNumber, generatedMessage);
-        if (result.success) {
-          return true;
-        }
+    final subscriptionIds = _subscriptionIdsToTry();
+    SmsFailureReason? lastFailureReason;
 
-        debugPrint(
-          "Native SMS send failed for $phoneNumber on attempt $attempt: ${result.errorMessage}",
-        );
-      } catch (e) {
-        debugPrint(
-          "Error sending SMS to $phoneNumber on attempt $attempt: $e",
-        );
+    for (var attempt = 1; attempt <= _smsMaxAttemptsPerContact; attempt++) {
+      for (
+        var index = 0;
+        index < subscriptionIds.length && index < _smsMaxSimSwitchesPerAttempt;
+        index++
+      ) {
+        final subscriptionId = subscriptionIds[index];
+        try {
+          final result = await _sendDirectSmsNative(
+            phoneNumber,
+            generatedMessage,
+            overrideSubscriptionId: subscriptionId,
+          );
+          if (result.success) {
+            if (subscriptionId != null &&
+                selectedSmsSubscriptionId.value != subscriptionId) {
+              selectedSmsSubscriptionId.value = subscriptionId;
+              final prefs = await SharedPreferences.getInstance();
+              await prefs.setInt(
+                _preferredSmsSubscriptionPrefsKey,
+                subscriptionId,
+              );
+            }
+            return const _SmsSendOutcome(success: true);
+          }
+
+          lastFailureReason = _classifySmsFailure(result.errorMessage);
+          debugPrint(
+            "[SOS SMS] Native SMS send failed for ${_maskContact(phoneNumber)} "
+            "on attempt $attempt ${subscriptionId == null ? '(default SIM)' : '(SIM $subscriptionId)'}: "
+            "${result.errorMessage}",
+          );
+
+          if (index < subscriptionIds.length - 1 &&
+              _shouldTryAlternateSim(lastFailureReason)) {
+            smsRetryStatus.value = 'Trying alternate SMS SIM...';
+            continue;
+          }
+        } catch (e) {
+          lastFailureReason = SmsFailureReason.deviceRestriction;
+          debugPrint(
+            "[SOS SMS] Error sending SMS to ${_maskContact(phoneNumber)} on attempt $attempt: $e",
+          );
+        }
       }
 
       if (attempt < _smsMaxAttemptsPerContact) {
         smsRetryStatus.value =
-            'Retrying $phoneNumber (${attempt + 1}/$_smsMaxAttemptsPerContact)...';
-        await Future<void>.delayed(_smsRetryGap);
+            'Retrying ${_maskContact(phoneNumber)} (${attempt + 1}/$_smsMaxAttemptsPerContact)...';
+        await Future<void>.delayed(
+          Duration(seconds: _smsRetryGap.inSeconds * (1 << (attempt - 1))),
+        );
         continue;
       }
     }
 
-    debugPrint("SMS permanently failed for $phoneNumber");
-    return false;
+    debugPrint(
+      "[SOS SMS] SMS permanently failed for ${_maskContact(phoneNumber)}",
+    );
+    return _SmsSendOutcome(
+      success: false,
+      failureReason: lastFailureReason ?? SmsFailureReason.unknown,
+      userFacingStatus:
+          'Trying backup delivery for ${_maskContact(phoneNumber)}...',
+    );
   }
 
   Future<NativeSmsSendResult> _sendDirectSmsNative(
     String phoneNumber,
-    String message,
-  ) async {
+    String message, {
+    int? overrideSubscriptionId,
+  }) async {
     if (!Platform.isAndroid) {
       return const NativeSmsSendResult(
         success: false,
@@ -676,14 +745,13 @@ class SosController extends GetxController {
     }
 
     try {
-      final response = await _smsChannel.invokeMethod<Map<dynamic, dynamic>>(
-        'sendDirectSms',
-        {
-          'phoneNumber': phoneNumber,
-          'message': message,
-          'subscriptionId': selectedSmsSubscriptionId.value,
-        },
-      );
+      final response = await _smsChannel
+          .invokeMethod<Map<dynamic, dynamic>>('sendDirectSms', {
+            'phoneNumber': phoneNumber,
+            'message': message,
+            'subscriptionId':
+                overrideSubscriptionId ?? selectedSmsSubscriptionId.value,
+          });
       final data = Map<String, dynamic>.from(response ?? const {});
       return NativeSmsSendResult(
         success: data['success'] == true,
@@ -695,10 +763,7 @@ class SosController extends GetxController {
         errorMessage: e.message ?? e.code,
       );
     } catch (e) {
-      return NativeSmsSendResult(
-        success: false,
-        errorMessage: e.toString(),
-      );
+      return NativeSmsSendResult(success: false, errorMessage: e.toString());
     }
   }
 
@@ -720,8 +785,11 @@ class SosController extends GetxController {
       availableSmsSubscriptions.assignAll(subscriptions);
 
       final selectedId = selectedSmsSubscriptionId.value;
-      final hasSelectedMatch = selectedId != null &&
-          subscriptions.any((subscription) => subscription.subscriptionId == selectedId);
+      final hasSelectedMatch =
+          selectedId != null &&
+          subscriptions.any(
+            (subscription) => subscription.subscriptionId == selectedId,
+          );
       if (!hasSelectedMatch) {
         SmsSubscriptionInfo? defaultSubscription;
         for (final subscription in subscriptions) {
@@ -796,6 +864,100 @@ class SosController extends GetxController {
     }
   }
 
+  List<int?> _subscriptionIdsToTry() {
+    final ordered = <int?>[];
+    final selectedId = selectedSmsSubscriptionId.value;
+    if (selectedId != null) {
+      ordered.add(selectedId);
+    }
+
+    for (final subscription in availableSmsSubscriptions) {
+      if (!ordered.contains(subscription.subscriptionId)) {
+        ordered.add(subscription.subscriptionId);
+      }
+    }
+
+    if (ordered.isEmpty) {
+      ordered.add(null);
+    }
+
+    return ordered;
+  }
+
+  SmsFailureReason _classifySmsFailure(String? errorMessage) {
+    final message = errorMessage?.toLowerCase() ?? '';
+    if (message.contains('permission')) {
+      return SmsFailureReason.permissionDenied;
+    }
+    if (message.contains('no mobile service') ||
+        message.contains('no service') ||
+        message.contains('radio is off')) {
+      return SmsFailureReason.noService;
+    }
+    if (message.contains('subscription') ||
+        message.contains('sim') ||
+        message.contains('carrier') ||
+        message.contains('slot')) {
+      return SmsFailureReason.noSimSelected;
+    }
+    if (message.contains('generic sms failure') ||
+        message.contains('direct sms failed') ||
+        message.contains('device')) {
+      return SmsFailureReason.deviceRestriction;
+    }
+    return SmsFailureReason.unknown;
+  }
+
+  bool _shouldTryAlternateSim(SmsFailureReason? reason) {
+    return reason == SmsFailureReason.noService ||
+        reason == SmsFailureReason.noSimSelected ||
+        reason == SmsFailureReason.deviceRestriction;
+  }
+
+  Future<void> _triggerAlternativeCommunicationFallback({
+    required SmsFailureReason reason,
+    bool autoShare = false,
+  }) async {
+    smsStatusMessage.value = 'Trying alternative communication methods...';
+    smsRetryStatus.value = _fallbackStatusLabel(reason);
+    debugPrint(
+      '[SOS SMS] Triggering alternative communication fallback: $reason',
+    );
+
+    if (!autoShare || generatedMessage.isEmpty) {
+      return;
+    }
+
+    try {
+      await Share.share(generatedMessage, subject: "URGENT SOS");
+    } catch (e) {
+      debugPrint('[SOS SMS] Share fallback failed: $e');
+    }
+  }
+
+  String _fallbackStatusLabel(SmsFailureReason reason) {
+    switch (reason) {
+      case SmsFailureReason.permissionDenied:
+        return 'SMS permission unavailable. Opening backup sharing...';
+      case SmsFailureReason.noSimSelected:
+        return 'Trying alternate SMS SIM...';
+      case SmsFailureReason.noService:
+        return 'Network unavailable. Switching communication method...';
+      case SmsFailureReason.deviceRestriction:
+        return 'Device blocked direct SMS. Opening backup sharing...';
+      case SmsFailureReason.unknown:
+        return 'Sending via alternative method...';
+    }
+  }
+
+  String _maskContact(String phoneNumber) {
+    if (phoneNumber.length <= 4) {
+      return phoneNumber;
+    }
+    final suffix = phoneNumber.substring(phoneNumber.length - 4);
+    return '••••$suffix';
+  }
+
   void _resetSmsStatus() {
     smsStatusMessage.value = 'Preparing emergency alerts...';
     smsRetryStatus.value = '';
@@ -824,6 +986,18 @@ class SosController extends GetxController {
     }
   }
 
+  Future<void> shareSafeStatus() async {
+    final user = FirebaseAuth.instance.currentUser;
+    final safeName = user?.displayName?.trim();
+    final name = (safeName != null && safeName.isNotEmpty)
+        ? safeName
+        : 'The SafeRoute user';
+    await Share.share(
+      '$name is safe now. The SOS has been resolved.',
+      subject: 'SafeRoute Update',
+    );
+  }
+
   void closeAlert() {
     isSent.value = false;
     generatedMessage = '';
@@ -843,8 +1017,9 @@ class SosController extends GetxController {
 
       final now = DateTime.now();
       final nowMs = now.millisecondsSinceEpoch;
-      final sessionRef =
-          FirebaseFirestore.instance.collection('active_sos').doc(uid);
+      final sessionRef = FirebaseFirestore.instance
+          .collection('active_sos')
+          .doc(uid);
       final statsRef = FirebaseFirestore.instance.doc(_globalStatsDocPath);
       final userRef = FirebaseFirestore.instance.collection('users').doc(uid);
 
@@ -865,17 +1040,19 @@ class SosController extends GetxController {
 
         final victim = sessionData['victim'];
         final hasVictimData =
-            (victim is Map &&
-                victim['lat'] != null &&
-                victim['lng'] != null) ||
-            (sessionData['latitude'] != null && sessionData['longitude'] != null);
+            (victim is Map && victim['lat'] != null && victim['lng'] != null) ||
+            (sessionData['latitude'] != null &&
+                sessionData['longitude'] != null);
         if (!hasVictimData) {
-          throw Exception('Victim location data is missing for this SOS session.');
+          throw Exception(
+            'Victim location data is missing for this SOS session.',
+          );
         }
 
         final responders = List<String>.from(
-          (sessionData['responders'] as List<dynamic>? ?? [])
-              .map((e) => e.toString()),
+          (sessionData['responders'] as List<dynamic>? ?? []).map(
+            (e) => e.toString(),
+          ),
         );
 
         transaction.update(sessionRef, {
@@ -898,8 +1075,9 @@ class SosController extends GetxController {
         }, SetOptions(merge: true));
 
         for (final responderUid in responders) {
-          final responderRef =
-              FirebaseFirestore.instance.collection('users').doc(responderUid);
+          final responderRef = FirebaseFirestore.instance
+              .collection('users')
+              .doc(responderUid);
           transaction.set(responderRef, {
             'helpedRescuesCount': FieldValue.increment(1),
           }, SetOptions(merge: true));
@@ -923,6 +1101,12 @@ class SosController extends GetxController {
         backgroundColor: Colors.green,
         colorText: Colors.white,
       );
+
+      if (Get.isRegistered<SosCallController>()) {
+        unawaited(
+          SosCallController.instance.handleSafeConfirmed(sessionId: uid),
+        );
+      }
     } catch (e) {
       debugPrint("Error stopping SOS: \$e");
       Get.snackbar(
@@ -944,17 +1128,28 @@ class SosController extends GetxController {
 
     final nowMs = DateTime.now().millisecondsSinceEpoch;
     try {
-      await FirebaseFirestore.instance.collection('active_sos').doc(uid).update({
-        'latitude': position.latitude,
-        'longitude': position.longitude,
-        'victim': {
-          'lat': position.latitude,
-          'lng': position.longitude,
-          'lastUpdated': FieldValue.serverTimestamp(),
-          'lastUpdatedMs': nowMs,
+      await FirebaseFirestore.instance.collection('active_sos').doc(uid).update(
+        {
+          'latitude': position.latitude,
+          'longitude': position.longitude,
+          'victim': {
+            'lat': position.latitude,
+            'lng': position.longitude,
+            'lastUpdated': FieldValue.serverTimestamp(),
+            'lastUpdatedMs': nowMs,
+          },
+          'updatedAtMs': nowMs,
         },
-        'updatedAtMs': nowMs,
-      });
+      );
+      if (Get.isRegistered<SosCallController>()) {
+        unawaited(
+          SosCallController.instance.syncLocation(
+            sessionId: uid,
+            latitude: position.latitude,
+            longitude: position.longitude,
+          ),
+        );
+      }
     } catch (e) {
       debugPrint("Failed to update victim location: $e");
     }
@@ -1011,20 +1206,39 @@ class _SmsDispatchResult {
   const _SmsDispatchResult({
     required this.sentCount,
     required this.failedNumbers,
+    this.lastFailureReason,
   });
 
   final int sentCount;
   final List<String> failedNumbers;
+  final SmsFailureReason? lastFailureReason;
 }
 
-class NativeSmsSendResult {
-  const NativeSmsSendResult({
+class _SmsSendOutcome {
+  const _SmsSendOutcome({
     required this.success,
-    this.errorMessage,
+    this.failureReason,
+    this.userFacingStatus,
   });
 
   final bool success;
+  final SmsFailureReason? failureReason;
+  final String? userFacingStatus;
+}
+
+class NativeSmsSendResult {
+  const NativeSmsSendResult({required this.success, this.errorMessage});
+
+  final bool success;
   final String? errorMessage;
+}
+
+enum SmsFailureReason {
+  permissionDenied,
+  noSimSelected,
+  noService,
+  deviceRestriction,
+  unknown,
 }
 
 class SmsSubscriptionInfo {

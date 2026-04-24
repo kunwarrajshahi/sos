@@ -80,6 +80,22 @@ class MainActivity : FlutterActivity() {
                     result.success(getBatteryLevel())
                 }
 
+                "launchEmergencyCall" -> {
+                    val phoneNumber = call.argument<String>("phoneNumber")
+                    if (phoneNumber.isNullOrBlank()) {
+                        result.success(
+                            mapOf(
+                                "success" to false,
+                                "usedActionCall" to false,
+                                "errorMessage" to "Missing phone number.",
+                            ),
+                        )
+                        return@setMethodCallHandler
+                    }
+
+                    result.success(launchEmergencyCall(phoneNumber))
+                }
+
                 else -> result.notImplemented()
             }
         }
@@ -231,5 +247,40 @@ class MainActivity : FlutterActivity() {
             batteryManager?.getIntProperty(BatteryManager.BATTERY_PROPERTY_CAPACITY)
                 ?: return null
         return if (level in 0..100) level else null
+    }
+
+    private fun launchEmergencyCall(phoneNumber: String): Map<String, Any?> {
+        return try {
+            val hasCallPermission =
+                ContextCompat.checkSelfPermission(
+                    this,
+                    Manifest.permission.CALL_PHONE,
+                ) == PackageManager.PERMISSION_GRANTED
+
+            val action =
+                if (hasCallPermission) {
+                    Intent.ACTION_CALL
+                } else {
+                    Intent.ACTION_DIAL
+                }
+
+            val intent =
+                Intent(action).apply {
+                    data = android.net.Uri.parse("tel:$phoneNumber")
+                    addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                }
+            startActivity(intent)
+            mapOf(
+                "success" to true,
+                "usedActionCall" to hasCallPermission,
+                "errorMessage" to null,
+            )
+        } catch (e: Exception) {
+            mapOf(
+                "success" to false,
+                "usedActionCall" to false,
+                "errorMessage" to (e.message ?: "Failed to launch emergency call."),
+            )
+        }
     }
 }

@@ -1,9 +1,18 @@
+import 'package:cloud_firestore/cloud_firestore.dart';
+import 'package:firebase_auth/firebase_auth.dart';
 import 'package:flutter/material.dart';
 import 'package:get/get.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 import 'package:permission_handler/permission_handler.dart';
 
 class ContactController extends GetxController {
+  static ContactController instanceOrCreate() {
+    if (Get.isRegistered<ContactController>()) {
+      return Get.find<ContactController>();
+    }
+    return Get.put(ContactController());
+  }
+
   var contacts = <String>[].obs;
   var isSmsPermissionGranted = false.obs;
 
@@ -87,9 +96,15 @@ class ContactController extends GetxController {
   }
 
   Future<void> addContact(String phoneNumber) async {
+    if (contacts.length >= 4) {
+      Get.snackbar("Limit Reached", "SafeRoute supports up to 4 emergency contacts.");
+      return;
+    }
+
     if (phoneNumber.isNotEmpty && !contacts.contains(phoneNumber)) {
       contacts.add(phoneNumber);
       await _saveContacts();
+      await _syncContactsToFirestore();
       Get.snackbar("Success", "Contact added successfully");
     }
   }
@@ -97,10 +112,37 @@ class ContactController extends GetxController {
   Future<void> removeContact(String phoneNumber) async {
     contacts.remove(phoneNumber);
     await _saveContacts();
+    await _syncContactsToFirestore();
+  }
+
+  Future<void> updateContact(String oldValue, String newValue) async {
+    final index = contacts.indexOf(oldValue);
+    if (index == -1 || newValue.isEmpty) return;
+
+    contacts[index] = newValue;
+    await _saveContacts();
+    await _syncContactsToFirestore();
   }
 
   Future<void> _saveContacts() async {
     final prefs = await SharedPreferences.getInstance();
     await prefs.setStringList('emergency_contacts', contacts);
+  }
+
+  Future<void> _syncContactsToFirestore() async {
+    final user = FirebaseAuth.instance.currentUser;
+    if (user == null) return;
+
+    final data = <String, dynamic>{
+      'emergencyContact1': contacts.isNotEmpty ? contacts[0] : '',
+      'emergencyContact2': contacts.length > 1 ? contacts[1] : '',
+      'emergencyContact3': contacts.length > 2 ? contacts[2] : '',
+      'emergencyContact4': contacts.length > 3 ? contacts[3] : '',
+    };
+
+    await FirebaseFirestore.instance.collection('users').doc(user.uid).set(
+      data,
+      SetOptions(merge: true),
+    );
   }
 }

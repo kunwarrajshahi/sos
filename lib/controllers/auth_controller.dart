@@ -6,10 +6,11 @@ import 'package:shared_preferences/shared_preferences.dart';
 import '../screens/map_screen.dart';
 import '../screens/login_screen.dart';
 import 'contact_controller.dart';
+import 'rescue_invite_controller.dart';
 
 class AuthController extends GetxController {
   static AuthController instance = Get.find();
-  
+
   late Rx<User?> _user;
   FirebaseAuth auth = FirebaseAuth.instance;
   FirebaseFirestore firestore = FirebaseFirestore.instance;
@@ -23,12 +24,15 @@ class AuthController extends GetxController {
   }
 
   // Navigate according to auth state changes seamlessly
-  _initialScreen(User? user) {
+  void _initialScreen(User? user) {
     if (user == null) {
       Get.offAll(() => const LoginScreen());
     } else {
       _syncUserConstraints(user.uid);
       Get.offAll(() => const MapScreen());
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        RescueInviteController.instance.processPendingInviteAfterAuth();
+      });
     }
   }
 
@@ -39,20 +43,20 @@ class AuthController extends GetxController {
       if (doc.exists) {
         Map<String, dynamic> data = doc.data() as Map<String, dynamic>;
         List<String> userContacts = [];
-        if (data['emergencyContact1'] != null && data['emergencyContact1'].toString().isNotEmpty) {
-           userContacts.add(data['emergencyContact1']);
+        for (var i = 1; i <= 4; i++) {
+          final value = data['emergencyContact$i'];
+          if (value != null && value.toString().isNotEmpty) {
+            userContacts.add(value.toString());
+          }
         }
-        if (data['emergencyContact2'] != null && data['emergencyContact2'].toString().isNotEmpty) {
-           userContacts.add(data['emergencyContact2']);
-        }
-        
-        // Push aggressively back into SharedPreferences 
+
+        // Push aggressively back into SharedPreferences
         final prefs = await SharedPreferences.getInstance();
         await prefs.setStringList('emergency_contacts', userContacts);
-        
+
         // Dynamically invoke ContactController if already alive
         if (Get.isRegistered<ContactController>()) {
-           Get.find<ContactController>().loadContacts();
+          Get.find<ContactController>().loadContacts();
         }
       }
     } catch (e) {
@@ -60,9 +64,19 @@ class AuthController extends GetxController {
     }
   }
 
-  Future<void> register(String name, String email, String password, String phone, String ec1, String ec2) async {
+  Future<void> register(
+    String name,
+    String email,
+    String password,
+    String phone,
+    String ec1,
+    String ec2,
+  ) async {
     try {
-      UserCredential cred = await auth.createUserWithEmailAndPassword(email: email, password: password);
+      UserCredential cred = await auth.createUserWithEmailAndPassword(
+        email: email,
+        password: password,
+      );
       // Immediately hydrate the Firestore blueprint for this UID
       await firestore.collection('users').doc(cred.user!.uid).set({
         'name': name,
@@ -70,22 +84,24 @@ class AuthController extends GetxController {
         'phone': phone,
         'emergencyContact1': ec1,
         'emergencyContact2': ec2,
-        'createdAt': FieldValue.serverTimestamp()
+        'emergencyContact3': '',
+        'emergencyContact4': '',
+        'createdAt': FieldValue.serverTimestamp(),
       });
       Get.snackbar(
-        "Account Created", 
-        "Welcome $name!", 
+        "Account Created",
+        "Welcome $name!",
         snackPosition: SnackPosition.BOTTOM,
         backgroundColor: Colors.green,
-        colorText: Colors.white
+        colorText: Colors.white,
       );
     } catch (e) {
       Get.snackbar(
-        "Registration Failed", 
-        e.toString().replaceFirst(RegExp(r'\[.*\] '), ''), 
+        "Registration Failed",
+        e.toString().replaceFirst(RegExp(r'\[.*\] '), ''),
         snackPosition: SnackPosition.BOTTOM,
         backgroundColor: Colors.redAccent,
-        colorText: Colors.white
+        colorText: Colors.white,
       );
     }
   }
@@ -95,11 +111,11 @@ class AuthController extends GetxController {
       await auth.signInWithEmailAndPassword(email: email, password: password);
     } catch (e) {
       Get.snackbar(
-        "Login Failed", 
-        e.toString().replaceFirst(RegExp(r'\[.*\] '), ''), 
+        "Login Failed",
+        e.toString().replaceFirst(RegExp(r'\[.*\] '), ''),
         snackPosition: SnackPosition.BOTTOM,
         backgroundColor: Colors.redAccent,
-        colorText: Colors.white
+        colorText: Colors.white,
       );
     }
   }

@@ -10,7 +10,7 @@ import 'package:safe_route/widgets/unsafe_area_dialog.dart';
 // ============================================================================
 
 class Example1_SimpleDialog extends StatelessWidget {
-  const Example1_SimpleDialog({Key? key}) : super(key: key);
+  const Example1_SimpleDialog({super.key});
 
   void _showDialog(BuildContext context) {
     showDialog(
@@ -43,7 +43,7 @@ class Example1_SimpleDialog extends StatelessWidget {
 // ============================================================================
 
 class Example2_WithGeolocator extends StatefulWidget {
-  const Example2_WithGeolocator({Key? key}) : super(key: key);
+  const Example2_WithGeolocator({super.key});
 
   @override
   State<Example2_WithGeolocator> createState() =>
@@ -125,7 +125,7 @@ class _Example2_WithGeolocatorState extends State<Example2_WithGeolocator> {
 // ============================================================================
 
 class Example3_WithFirebase extends StatelessWidget {
-  const Example3_WithFirebase({Key? key}) : super(key: key);
+  const Example3_WithFirebase({super.key});
 
   void _showDialog(BuildContext context) {
     showDialog(
@@ -198,7 +198,7 @@ class Example3_WithFirebase extends StatelessWidget {
 // ============================================================================
 
 class Example4_WithFAB extends StatelessWidget {
-  const Example4_WithFAB({Key? key}) : super(key: key);
+  const Example4_WithFAB({super.key});
 
   @override
   Widget build(BuildContext context) {
@@ -238,8 +238,7 @@ class Example4_WithFAB extends StatelessWidget {
 class Example5_EditExistingReport extends StatefulWidget {
   final UnsafeAreaData existingReport;
 
-  const Example5_EditExistingReport({Key? key, required this.existingReport})
-    : super(key: key);
+  const Example5_EditExistingReport({super.key, required this.existingReport});
 
   @override
   State<Example5_EditExistingReport> createState() =>
@@ -287,7 +286,7 @@ class _Example5_EditExistingReportState
 // ============================================================================
 
 class Example6_MultipleDialogs extends StatelessWidget {
-  const Example6_MultipleDialogs({Key? key}) : super(key: key);
+  const Example6_MultipleDialogs({super.key});
 
   Future<void> _showConfirmationDialog(
     BuildContext context,
@@ -350,7 +349,7 @@ class Example6_MultipleDialogs extends StatelessWidget {
 // ============================================================================
 
 class Example7_WithErrorHandling extends StatefulWidget {
-  const Example7_WithErrorHandling({Key? key}) : super(key: key);
+  const Example7_WithErrorHandling({super.key});
 
   @override
   State<Example7_WithErrorHandling> createState() =>

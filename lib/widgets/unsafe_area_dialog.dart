@@ -7,12 +7,12 @@ class UnsafeAreaDialog extends StatefulWidget {
   final double longitude;
 
   const UnsafeAreaDialog({
-    Key? key,
+    super.key,
     required this.onConfirm,
     this.onCancel,
     required this.latitude,
     required this.longitude,
-  }) : super(key: key);
+  });
 
   @override
   State<UnsafeAreaDialog> createState() => _UnsafeAreaDialogState();
@@ -226,8 +226,6 @@ class _UnsafeAreaDialogState extends State<UnsafeAreaDialog>
       }).toList(),
     );
   }
-
-
 
   Widget _buildChip({
     required String label,

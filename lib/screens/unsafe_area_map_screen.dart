@@ -8,7 +8,7 @@ import '../widgets/unsafe_area_dialog.dart';
 /// - Reason select kar sakta hai (Harassment, Poor Lighting, etc.)
 /// - Time entry kar sakta hai (kab area unsafe tha)
 class UnsafeAreaMapScreen extends StatefulWidget {
-  const UnsafeAreaMapScreen({Key? key}) : super(key: key);
+  const UnsafeAreaMapScreen({super.key});
 
   @override
   State<UnsafeAreaMapScreen> createState() => _UnsafeAreaMapScreenState();
@@ -43,6 +43,18 @@ class _UnsafeAreaMapScreenState extends State<UnsafeAreaMapScreen> {
         latitude: latitude,
         longitude: longitude,
         onConfirm: (data) {
+          if (data.timeStart == null || data.timeEnd == null) {
+            ScaffoldMessenger.of(context).showSnackBar(
+              const SnackBar(
+                content: Text(
+                  'Area not marked: Timing data is required to maintain the red circle.',
+                ),
+                backgroundColor: Colors.orange,
+              ),
+            );
+            return;
+          }
+
           // Marker add karna map pe
           _addMarkerToMap(data);
 
@@ -164,26 +176,42 @@ class _UnsafeAreaMapScreenState extends State<UnsafeAreaMapScreen> {
     showDialog(
       context: context,
       builder: (context) => AlertDialog(
-        title: const Text('Unsafe Area Details'),
-        content: SingleChildScrollView(
-          child: Column(
-            crossAxisAlignment: CrossAxisAlignment.start,
-            mainAxisSize: MainAxisSize.min,
-            children: [
-              _buildDetailRow(
-                'Location',
-                '${data.latitude.toStringAsFixed(4)}, ${data.longitude.toStringAsFixed(4)}',
+        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(16)),
+        title: Row(
+          children: [
+            const Icon(Icons.access_time, color: Colors.red),
+            const SizedBox(width: 8),
+            const Text('Unsafe Timing'),
+          ],
+        ),
+        content: Column(
+          mainAxisSize: MainAxisSize.min,
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Container(
+              padding: const EdgeInsets.all(12),
+              decoration: BoxDecoration(
+                color: Colors.red.shade50,
+                borderRadius: BorderRadius.circular(8),
+                border: Border.all(color: Colors.red.shade200),
               ),
-              _buildDetailRow('Reason', data.reason ?? 'Not specified'),
-              if (data.timeType != null)
-                _buildDetailRow('Time Type', data.timeType!),
-              if (data.timeStart != null && data.timeEnd != null)
-                _buildDetailRow(
-                  'Time Range',
-                  '${data.timeStart} - ${data.timeEnd}',
-                ),
-            ],
-          ),
+              child: Row(
+                mainAxisAlignment: MainAxisAlignment.center,
+                children: [
+                  Text(
+                    '${data.timeStart} - ${data.timeEnd}',
+                    style: const TextStyle(
+                      fontSize: 18,
+                      fontWeight: FontWeight.bold,
+                      color: Colors.red,
+                    ),
+                  ),
+                ],
+              ),
+            ),
+            const SizedBox(height: 16),
+            _buildDetailRow('Reason', data.reason ?? 'Not specified'),
+          ],
         ),
         actions: [
           TextButton(
@@ -203,7 +231,7 @@ class _UnsafeAreaMapScreenState extends State<UnsafeAreaMapScreen> {
               });
             },
             style: FilledButton.styleFrom(backgroundColor: Colors.red),
-            child: const Text('Delete'),
+            child: const Text('Remove'),
           ),
         ],
       ),
@@ -274,8 +302,8 @@ class _UnsafeAreaMapScreenState extends State<UnsafeAreaMapScreen> {
               mapController: mapController,
               options: MapOptions(
                 // Initial center (Delhi)
-                center: const LatLng(28.6139, 77.2090),
-                zoom: 13,
+                initialCenter: const LatLng(28.6139, 77.2090),
+                initialZoom: 13,
                 // Long press handler directly
                 onLongPress: _onMapLongPress,
               ),

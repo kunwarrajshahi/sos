@@ -1,13 +1,13 @@
 {
   "project_info": {
-    "project_number": "737992185007",
-    "project_id": "shee-a0c0b",
-    "storage_bucket": "shee-a0c0b.firebasestorage.app"
+    "project_number": "771521687360",
+    "project_id": "saferoute-55bb6",
+    "storage_bucket": "saferoute-55bb6.firebasestorage.app"
   },
   "client": [
     {
       "client_info": {
-        "mobilesdk_app_id": "1:737992185007:android:26b3a31588345bcc18b05a",
+        "mobilesdk_app_id": "1:771521687360:android:a9d36e102c6b33646a94a5",
         "android_client_info": {
           "package_name": "com.example.safe_route"
         }
@@ -15,7 +15,7 @@
       "oauth_client": [],
       "api_key": [
         {
-          "current_key": "AIzaSyBs_iTv31hzGIMkJh3IhnrNyIS0iIi8F0E"
+          "current_key": "AIzaSyAcMMheGmuREjLO5VKAieWN3iqYfQwdP94"
         }
       ],
       "services": {

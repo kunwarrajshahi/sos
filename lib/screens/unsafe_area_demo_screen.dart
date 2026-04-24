@@ -3,7 +3,7 @@ import '../widgets/unsafe_area_dialog.dart';
 
 /// Demo screen showing how to use the UnsafeAreaDialog
 class UnsafeAreaDemoScreen extends StatefulWidget {
-  const UnsafeAreaDemoScreen({Key? key}) : super(key: key);
+  const UnsafeAreaDemoScreen({super.key});
 
   @override
   State<UnsafeAreaDemoScreen> createState() => _UnsafeAreaDemoScreenState();

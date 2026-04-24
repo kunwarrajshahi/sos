@@ -70,5 +70,16 @@
 	<string>This app needs access to location when open to show your position on the map.</string>
 	<key>NSLocationAlwaysUsageDescription</key>
 	<string>This app needs access to location when in the background.</string>
+	<key>CFBundleURLTypes</key>
+	<array>
+		<dict>
+			<key>CFBundleURLName</key>
+			<string>com.saferoute.app</string>
+			<key>CFBundleURLSchemes</key>
+			<array>
+				<string>saferoute</string>
+			</array>
+		</dict>
+	</array>
 </dict>
 </plist>

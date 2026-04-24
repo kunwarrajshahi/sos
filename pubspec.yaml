@@ -44,7 +44,9 @@ dependencies:
   sensors_plus: ^7.0.0
   firebase_core: ^4.6.0
   cloud_firestore: ^6.2.0
+  geocoding: ^4.0.0
   shared_preferences: ^2.5.5
+  app_links: ^6.3.3
   firebase_auth: ^6.3.0
   http: ^1.6.0
   url_launcher: ^6.3.2
